@@ -227,6 +227,8 @@ if __name__ == "__main__":
     os.makedirs(args.outdir, exist_ok=True)
     running_details = os.path.join(args.outdir, "Running_details.txt")
 
+    print(f'\nComputing satellite positions over {len(night_ts['time'])} timestamps for each satellite.')
+
     # Share one lock across worker processes so their tqdm.write() calls
     # (satellite-finished messages) don't interleave/corrupt the main
     # process's satellite-count progress bar below.
