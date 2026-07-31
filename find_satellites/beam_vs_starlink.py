@@ -18,6 +18,12 @@ Outputs:
     - Figure: RA/Dec scatter of in-beam satellite positions colored by UTC
       time, overlaid on the drifting beam outline (--outfile,
       beam_vs_starlink.png by default).
+    - Text file (<outfile stem>_fov_times.txt): for each satellite, the UTC
+      timestamp it first enters the beam and the timestamp of its last
+      in-beam sample before leaving, i.e. the start/end of its FOV crossing
+      in this window. Computed from beam membership regardless of
+      --all-positions, so it's always the true entry/exit time, not just
+      the first/last propagated sample.
 
 Usage:
     python beam_vs_starlink.py TLE_FILE
@@ -47,6 +53,7 @@ radius) - shared with find_fov_passes.py, rather than a second copy here.
 
 import argparse
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 
@@ -172,7 +179,9 @@ def work_func_sat(sat_data, night_ts, in_beam_only=True):
     (default) yields only in-beam samples, False yields every night-time
     sample regardless of beam membership (--all-positions mode). Either
     way this just accumulates whatever's yielded directly - no need to
-    pre-size arrays for the full time range.
+    pre-size arrays for the full time range. Beam entry/exit times (see
+    below) are tracked from actual beam membership either way, so they
+    don't depend on in_beam_only.
 
     Takes the whole night_ts TimeSeries (not just night_ts['time']) and
     extracts the column here, inside the worker, after it's been pickled
@@ -192,11 +201,22 @@ def work_func_sat(sat_data, night_ts, in_beam_only=True):
     x, y, z = [], [], []
     ra, dec = [], []
     idx = []  # position of each hit in the original `times`, for date_nums[idx] later
+    # First/last timestamp actually inside the beam - tracked from zen_sep
+    # directly (not from `idx`/in_beam_only) so it's correct even in
+    # --all-positions mode, where every night-time sample is yielded/kept,
+    # not just in-beam ones. `times` is chronological, so the first/last
+    # in-beam sample encountered here is the true entry/exit time.
+    beam_entry, beam_exit = None, None
 
-    for sample_idx, t1, itrs, altaz, _zen_sep in propagate_in_beam(
+    for sample_idx, t1, itrs, altaz, zen_sep in propagate_in_beam(
         satellite_name, tle1, tle2, times, hera_location, fov_angular_radius,
         in_beam_only=in_beam_only,
     ):
+        if zen_sep <= fov_angular_radius:
+            if beam_entry is None:
+                beam_entry = t1
+            beam_exit = t1
+
         # In-beam: convert to RA/Dec for plotting on the sky.
         sky = altaz.transform_to(GCRS(obstime=t1))
         loc = itrs.earth_location
@@ -215,7 +235,8 @@ def work_func_sat(sat_data, night_ts, in_beam_only=True):
     # other arrays so the caller can pick out the matching timestamps
     # (e.g. date_nums[idx]) for plotting.
     return (satellite_name, np.array(latitudes), np.array(longitudes),
-            np.array(ra), np.array(dec), np.array(idx, dtype=int))
+            np.array(ra), np.array(dec), np.array(idx, dtype=int),
+            beam_entry, beam_exit)
 
 
 #
@@ -286,6 +307,24 @@ if __name__ == "__main__":
             total=len(sats), desc="Satellites", disable=args.no_progress,
         ))
 
+    # --- FOV entry/exit times -------------------------------------------
+    # For each satellite, the UTC timestamp it first entered the beam and
+    # its last in-beam sample before leaving, from beam_entry/beam_exit
+    # computed in work_func_sat (regardless of --all-positions).
+    fov_times_path = Path(args.outfile).with_name(Path(args.outfile).stem + "_fov_times.txt")
+    with open(fov_times_path, "w", encoding="utf-8") as f:
+        f.write(f"FOV entry/exit times, {t0.iso} to {t_end.iso}\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"{'Satellite':<20}{'First in FOV (UTC)':<27}{'Last in FOV (UTC)':<27}\n")
+        for satname, _lat, _lon, _ra, _dec, _idx, beam_entry, beam_exit in sorted(
+            results, key=lambda r: r[0]
+        ):
+            if beam_entry is None:
+                f.write(f"{satname:<20}never in FOV during this window\n")
+            else:
+                f.write(f"{satname:<20}{beam_entry.iso:<27}{beam_exit.iso:<27}\n")
+    print(f"Saved FOV entry/exit times to {fov_times_path}")
+
     # Build FoV outline (zenith radius 5 deg) for each time stamp.
     # Centre = HERA's zenith, transformed AltAz -> GCRS the same way satellite
     # positions are (see the import comment for why GCRS, not ICRS), so the
@@ -337,7 +376,7 @@ if __name__ == "__main__":
     # last (some have zero in-beam points).
     cmap = plt.get_cmap('coolwarm')
     norm = colors.Normalize(vmin=date_nums.min(), vmax=date_nums.max())
-    for satname, lat, lon, ra_arr, dec_arr, idx in results:
+    for satname, lat, lon, ra_arr, dec_arr, idx, _beam_entry, _beam_exit in results:
         ax.scatter(ra_arr, dec_arr,
                    c=date_nums[idx], marker='o',
                    cmap=cmap, norm=norm, s=1, lw=1.3, label=satname)
