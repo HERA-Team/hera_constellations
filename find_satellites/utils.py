@@ -58,15 +58,24 @@ def filter_to_night(ts, location):
     return TimeSeries(time=ts['time'][sun_alt < 0 * units.deg])
 
 
-def propagate_in_beam(name, tle_line1, tle_line2, times, location, fov_radius):
-    """Propagate one satellite across `times` and yield every in-beam sample.
+def propagate_in_beam(name, tle_line1, tle_line2, times, location, fov_radius,
+                       in_beam_only=True):
+    """Propagate one satellite across `times` and yield samples inside the beam.
 
     Builds its own SGP4 propagator from the TLE, then for each timestamp in
     `times` (any iterable of astropy Time objects - a plain array or a
     tqdm-wrapped one, this function doesn't care) runs the shared physics
     chain: SGP4 -> TEME -> ITRS -> AltAz, testing whether the result falls
-    within `fov_radius` of `location`'s zenith. SGP4 errors and out-of-beam
-    samples are silently skipped, matching the two scripts' prior behavior.
+    within `fov_radius` of `location`'s zenith. SGP4 errors are always
+    silently skipped, matching the two scripts' prior behavior.
+
+    in_beam_only: if True (default), samples outside `fov_radius` of zenith
+    are skipped too, so only true beam crossings are yielded - this is what
+    find_fov_passes.py and beam_vs_starlink.py's default mode rely on. Pass
+    False to yield every sample regardless of beam membership (zen_sep is
+    still computed and returned either way) - used by beam_vs_starlink.py's
+    --all-positions mode to reproduce the old rafas.py behaviour of plotting
+    a satellite's whole track, for comparison against the beam-filtered view.
 
     Note: no tqdm or multiprocessing-position logic here on purpose - that's
     specific to how each caller runs inside a Pool worker (see their own
@@ -108,7 +117,7 @@ def propagate_in_beam(name, tle_line1, tle_line2, times, location, fov_radius):
         # Angular distance from zenith; inside the FOV disk if within
         # fov_radius of it.
         zen_sep = 90 * units.deg - altaz.alt
-        if zen_sep > fov_radius:
+        if in_beam_only and zen_sep > fov_radius:
             continue  # outside the beam - skip
 
         yield idx, t1, itrs, altaz, zen_sep

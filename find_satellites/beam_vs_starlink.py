@@ -36,6 +36,11 @@ satellite just to find the few that are actually in the beam, it first
 checks find_fov_passes.py's existing <SAT>_results.csv output for which
 satellites have a pass in --start/--end, and only propagates those.
 
+--all-positions disables the beam-membership filter, plotting every
+night-time position of every satellite instead (the old rafas.py
+behaviour) - useful for comparing side by side against the default
+beam-filtered plot.
+
 To reuse for a different site/beam, edit parameters.py (HERA location, beam
 radius) - shared with find_fov_passes.py, rather than a second copy here.
 """
@@ -139,24 +144,35 @@ def parse_args():
              "Slurm/batch jobs, where in-place redraws just clutter the "
              "log file).",
     )
+    parser.add_argument(
+        "--all-positions", action="store_true",
+        help="Plot every propagated night-time position instead of only "
+             "the ones inside the beam - reproduces the old rafas.py "
+             "behaviour (full tracks, no beam-membership filtering), for "
+             "comparing against the default beam-filtered plot. The beam "
+             "outline is still drawn for reference; only the filtering of "
+             "satellite points changes.",
+    )
     return parser.parse_args()
 
 
 #  Worker Function
-def work_func_sat(sat_data, night_ts):
-    """Propagate one satellite and return only the samples inside HERA's beam.
+def work_func_sat(sat_data, night_ts, in_beam_only=True):
+    """Propagate one satellite and return the samples of interest.
 
     Run in its own process (see Pool.imap_unordered below), one call per
     satellite - sat_data is the (name, tle1, tle2) tuple for that
     satellite. Thin wrapper around utils.propagate_in_beam(), which does
     the actual SGP4/TEME/ITRS/AltAz work shared with find_fov_passes.py;
-    this function's own job is converting each in-beam sample to RA/Dec
+    this function's own job is converting each returned sample to RA/Dec
     (GCRS, not ICRS - see the import comment above for why) and geodetic
     position, and collecting the results.
 
-    propagate_in_beam() only yields samples already inside the beam, so
-    unlike the old NaN-prefill-and-mask approach, this just accumulates
-    hits directly - no need to pre-size arrays for the full time range.
+    in_beam_only: passed straight through to propagate_in_beam() - True
+    (default) yields only in-beam samples, False yields every night-time
+    sample regardless of beam membership (--all-positions mode). Either
+    way this just accumulates whatever's yielded directly - no need to
+    pre-size arrays for the full time range.
 
     Takes the whole night_ts TimeSeries (not just night_ts['time']) and
     extracts the column here, inside the worker, after it's been pickled
@@ -178,7 +194,8 @@ def work_func_sat(sat_data, night_ts):
     idx = []  # position of each hit in the original `times`, for date_nums[idx] later
 
     for sample_idx, t1, itrs, altaz, _zen_sep in propagate_in_beam(
-        satellite_name, tle1, tle2, times, hera_location, fov_angular_radius
+        satellite_name, tle1, tle2, times, hera_location, fov_angular_radius,
+        in_beam_only=in_beam_only,
     ):
         # In-beam: convert to RA/Dec for plotting on the sky.
         sky = altaz.transform_to(GCRS(obstime=t1))
@@ -261,7 +278,11 @@ if __name__ == "__main__":
     tqdm.set_lock(RLock())
     with Pool(4, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),)) as pool:
         results = list(tqdm(
-            pool.imap_unordered(partial(work_func_sat, night_ts=night_ts), sats),
+            pool.imap_unordered(
+                partial(work_func_sat, night_ts=night_ts,
+                        in_beam_only=not args.all_positions),
+                sats,
+            ),
             total=len(sats), desc="Satellites", disable=args.no_progress,
         ))
 
@@ -334,7 +355,8 @@ if __name__ == "__main__":
     # cut off at the plot edges.
     ax.set_xlim(ra_min - 2, ra_max + 2)
     ax.set_ylim(dec_min - 2, dec_max + 2)
-    ax.set_title(f"{args.constellation} Passes through HERA FoV\n"
+    title_suffix = " (all positions, no beam filter)" if args.all_positions else ""
+    ax.set_title(f"{args.constellation} Passes through HERA FoV{title_suffix}\n"
                  f"{t0.iso} to {t_end.iso}")
     ax.grid(alpha=0.5)
 
