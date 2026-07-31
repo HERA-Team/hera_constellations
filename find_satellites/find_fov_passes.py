@@ -12,14 +12,18 @@ sky in RA as Earth rotates).
 
 Outputs (written to --outdir, the current working directory by default):
     - <SATELLITE_NAME>_results.csv: a few '#'-prefixed comment lines
-      (satellite name, TLE used) followed by a CSV header and one data row
-      per night-time sample when the satellite was inside HERA's FOV:
-      timestamp,alt_deg,az_deg,zensep_deg (zensep = angular distance from
-      HERA's zenith). No rows means the satellite never passed through the
-      FOV in this time range. One independent file per satellite (rather
-      than one shared file/dataframe) so a worker crash or job preemption
-      only loses that satellite's output, and so satellites already done
-      don't need to be re-propagated on a re-run.
+      (satellite name, TLE used, time_delta) followed by a CSV header and
+      one data row per night-time sample when the satellite was inside
+      HERA's FOV: timestamp,alt_deg,az_deg,zensep_deg (zensep = angular
+      distance from HERA's zenith). No rows means the satellite never
+      passed through the FOV in this time range. One independent file per
+      satellite (rather than one shared file/dataframe) so a worker crash
+      or job preemption only loses that satellite's output.
+
+      If a satellite's CSV already exists and was generated with the same
+      time_delta this run would use, it's skipped rather than
+      re-propagated (a re-run after a crash/preemption only redoes the
+      missing ones) - pass --overwrite to force recomputation regardless.
     - Running_details.txt: the run's physical parameters (time range, FOV,
       time step, HERA location - shared by every satellite, so recorded
       once here rather than repeated in every file), plus wall-clock time,
@@ -122,6 +126,16 @@ def parse_args():
              "Slurm/batch jobs, where in-place redraws just clutter the "
              "log file).",
     )
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Recompute every satellite even if its <SAT>_results.csv "
+             "already exists with a matching time_delta. By default, a "
+             "satellite is skipped (not re-propagated) if its results file "
+             "is already there and was generated with the same time_delta "
+             "this run would use - only a missing file or a time_delta "
+             "mismatch (e.g. --day vs --season, which use different "
+             "cadences) triggers recomputation.",
+    )
     return parser.parse_args()
 
 
@@ -192,14 +206,36 @@ def work_func_sat(sat_data, outdir):
     name, tle_line1, tle_line2 = sat_data
     satellite_name = name.strip()
     output_filename = os.path.join(outdir, f"{satellite_name.replace(' ', '_')}_results.csv")
+    time_delta_s = time_delta.to_value(units.s)
+
+    if not args.overwrite and os.path.exists(output_filename):
+        existing_delta_s = None
+        with open(output_filename) as f:
+            for line in f:
+                if line.startswith("# time_delta_s:"):
+                    try:
+                        existing_delta_s = float(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                    break
+                if not line.startswith("#"):
+                    break  # comment header always comes first; nothing more to find
+        if existing_delta_s is not None and existing_delta_s == time_delta_s:
+            tqdm.write(f"\nSkipping {satellite_name}: {output_filename} already exists "
+                       f"with matching time_delta={existing_delta_s} s (use --overwrite to force).")
+            return
 
     with open(output_filename, 'w') as f:
         # Metadata comment lines (skipped by csv readers/pandas via
         # comment='#'); run-wide parameters live in Running_details.txt
-        # instead of being repeated in every satellite's file.
+        # instead of being repeated in every satellite's file. time_delta_s
+        # is recorded so a re-run can tell whether an existing file was
+        # generated at the same cadence (see the skip check above) rather
+        # than blindly reusing/overwriting it.
         f.write(f"# satellite: {satellite_name}\n")
         f.write(f"# tle_line1: {tle_line1}\n")
         f.write(f"# tle_line2: {tle_line2}\n")
+        f.write(f"# time_delta_s: {time_delta_s}\n")
         f.write("timestamp,alt_deg,az_deg,zensep_deg\n")
 
         n_visible = 0
