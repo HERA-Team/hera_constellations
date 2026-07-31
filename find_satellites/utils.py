@@ -117,7 +117,6 @@ def propagate_in_beam(name, tle_line1, tle_line2, times, location, fov_radius,
 
         # Angular distance from zenith
         # inside the FOV disk if within fov_radius of it.
-        # print(altaz.alt.deg)
         zen_sep = 90 * units.deg - altaz.alt
         if in_beam_only and zen_sep > fov_radius:
             continue  # outside the beam - skip

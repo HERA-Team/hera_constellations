@@ -290,7 +290,6 @@ if __name__ == "__main__":
     # satellite kept above.
     if args.limit is not None:
         sats = sats[:args.limit]
-    sats = [sats[19]]
     print(f"Number of satellites: {len(sats)}")
 
     tqdm.set_lock(RLock())
@@ -385,8 +384,6 @@ if __name__ == "__main__":
         ax.scatter(ra_arr, dec_arr,
                    c=date_nums[idx], marker='o',
                    cmap=cmap, norm=norm, s=1, lw=1.3, label=satname)
-        if satname in ['ORBCOMM FM 14', 'ORBCOMM FM 21', 'ORBCOMM FM 25', 'ORBCOMM FM 16 DEB']:
-            print(np.mean(ra_arr), np.mean(dec_arr))
 
     # Not 'equal': the RA range covered here (up to ~360 deg, since the
     # night-time filter can produce blocks many hours apart, over which
