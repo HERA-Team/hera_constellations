@@ -1,0 +1,9 @@
+*.pdf
+*.uvh5
+*.tar.gz
+find_satellites/__pycache__/
+find_satellites/.DS_Store
+CleanedCode_script/
+Notes with Josh.txt
+find_satellites/orbcomm*
+Plotting Satellite Trajectory/
