@@ -13,6 +13,7 @@ site/beam, not just the hardcoded HERA one in parameters.py.
 from pathlib import Path
 
 from astropy import units
+from astropy.time import Time
 from astropy.timeseries import TimeSeries
 # TEME: satellite-native True Equator Mean Equinox frame SGP4 propagates in.
 # ITRS: Earth-fixed frame used as a stepping stone to the topocentric view.
@@ -36,6 +37,23 @@ def read_tle_file(filename):
     for i in range(0, len(lines), 3):
         satellites.append((lines[i], lines[i + 1], lines[i + 2]))
     return satellites
+
+
+def utc_to_jd(utc_time):
+    """Convert a UTC date/time string to a Julian Date.
+
+    Accepts anything astropy.time.Time parses under scale='utc', e.g.
+    '2022-10-23T21:45:00.000' (isot) or '2022-10-23 21:45:00' (iso).
+    """
+    return Time(utc_time, scale="utc").jd
+
+
+def jd_to_utc(jd):
+    """Convert a Julian Date back to a UTC date/time string (isot format).
+
+    Inverse of utc_to_jd(), e.g. 2459876.4059606 -> '2022-10-23T21:45:00.000'.
+    """
+    return Time(jd, format="jd", scale="utc").isot
 
 
 def make_time_grid(t0, t_end, time_delta):
