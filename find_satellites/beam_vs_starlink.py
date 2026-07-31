@@ -41,6 +41,7 @@ radius) - shared with find_fov_passes.py, rather than a second copy here.
 """
 
 import argparse
+from functools import partial
 
 import numpy as np
 
@@ -57,8 +58,8 @@ from astropy.time import Time
 #   the beam outline.
 from astropy.coordinates import AltAz, GCRS, SkyCoord
 
-from tqdm import tqdm         # progress bar for the propagation loop
-from multiprocessing import Pool, RLock, current_process   # one worker process per satellite
+from tqdm import tqdm         # progress bar over satellites
+from multiprocessing import Pool, RLock   # one worker process per satellite
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -134,7 +135,7 @@ def parse_args():
     )
     parser.add_argument(
         "--no-progress", action="store_true",
-        help="Disable the per-satellite tqdm progress bars (useful for "
+        help="Disable the tqdm progress bar over satellites (useful for "
              "Slurm/batch jobs, where in-place redraws just clutter the "
              "log file).",
     )
@@ -142,14 +143,15 @@ def parse_args():
 
 
 #  Worker Function
-def work_func_sat(name, tle1, tle2, night_ts, no_progress=False):
+def work_func_sat(sat_data, night_ts):
     """Propagate one satellite and return only the samples inside HERA's beam.
 
-    Run in its own process (see Pool.starmap below), one call per satellite.
-    Thin wrapper around utils.propagate_in_beam(), which does the actual
-    SGP4/TEME/ITRS/AltAz work shared with find_fov_passes.py; this
-    function's own job is converting each in-beam sample to RA/Dec (GCRS,
-    not ICRS - see the import comment above for why) and geodetic
+    Run in its own process (see Pool.imap_unordered below), one call per
+    satellite - sat_data is the (name, tle1, tle2) tuple for that
+    satellite. Thin wrapper around utils.propagate_in_beam(), which does
+    the actual SGP4/TEME/ITRS/AltAz work shared with find_fov_passes.py;
+    this function's own job is converting each in-beam sample to RA/Dec
+    (GCRS, not ICRS - see the import comment above for why) and geodetic
     position, and collecting the results.
 
     propagate_in_beam() only yields samples already inside the beam, so
@@ -161,7 +163,12 @@ def work_func_sat(name, tle1, tle2, night_ts, no_progress=False):
     across to this process - a sliced-out mixin column pickles badly (it
     carries a weakref back to its parent table), while the TimeSeries
     itself pickles fine.
+
+    The progress bar (over satellites, not timestamps) lives in the main
+    process wrapping the Pool.imap_unordered call, so this function does no
+    tqdm bookkeeping of its own - see __main__ below.
     """
+    name, tle1, tle2 = sat_data
     satellite_name = name.strip()
     times = night_ts['time']
 
@@ -170,16 +177,8 @@ def work_func_sat(name, tle1, tle2, night_ts, no_progress=False):
     ra, dec = [], []
     idx = []  # position of each hit in the original `times`, for date_nums[idx] later
 
-    # Pin this worker's bar to its own terminal line (position) instead of
-    # all pool workers fighting over line 0, which is what garbles the
-    # output when several tqdm bars run in different processes at once.
-    # _identity[0] is the 1-based slot of this process within the Pool.
-    worker_slot = current_process()._identity[0]
-    progress_times = tqdm(times, desc=satellite_name,
-                           position=worker_slot, leave=False, disable=no_progress)
-
     for sample_idx, t1, itrs, altaz, _zen_sep in propagate_in_beam(
-        satellite_name, tle1, tle2, progress_times, hera_location, fov_angular_radius
+        satellite_name, tle1, tle2, times, hera_location, fov_angular_radius
     ):
         # In-beam: convert to RA/Dec for plotting on the sky.
         sky = altaz.transform_to(GCRS(obstime=t1))
@@ -259,16 +258,12 @@ if __name__ == "__main__":
         sats = sats[:args.limit]
     print(f"Number of satellites: {len(sats)}")
 
-    # Share one lock across worker processes so their tqdm bars (each
-    # pinned to its own line via `position` in work_func_sat) don't
-    # interleave/corrupt each other's terminal writes.
     tqdm.set_lock(RLock())
     with Pool(4, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),)) as pool:
-        results = pool.starmap(
-            work_func_sat,
-            [(name, tle1, tle2, night_ts, args.no_progress)
-             for name, tle1, tle2 in sats],
-        )
+        results = list(tqdm(
+            pool.imap_unordered(partial(work_func_sat, night_ts=night_ts), sats),
+            total=len(sats), desc="Satellites", disable=args.no_progress,
+        ))
 
     # Build FoV outline (zenith radius 5 deg) for each time stamp.
     # Centre = HERA's zenith, transformed AltAz -> GCRS the same way satellite

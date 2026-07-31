@@ -56,7 +56,7 @@ from functools import partial
 from astropy.time import Time
 from astropy import units
 
-from tqdm import tqdm         # per-satellite progress bar
+from tqdm import tqdm         # progress bar over satellites
 
 from multiprocessing import Pool, RLock, current_process
 
@@ -118,7 +118,7 @@ def parse_args():
     )
     parser.add_argument(
         "--no-progress", action="store_true",
-        help="Disable the per-satellite tqdm progress bars (useful for "
+        help="Disable the tqdm progress bar over satellites (useful for "
              "Slurm/batch jobs, where in-place redraws just clutter the "
              "log file).",
     )
@@ -173,27 +173,25 @@ if is_main_process:
 
 # ------------------------------ Worker ---------------------------------
 
-def work_func_sat(name, tle_line1, tle_line2, outdir, no_progress=False):
+def work_func_sat(sat_data, outdir):
     """Propagate one satellite and write every in-FOV timestamp + position to a CSV file.
 
-    Run in its own process (see Pool.starmap in __main__), one call per
-    satellite. Thin wrapper around utils.propagate_in_beam(), which does
-    the actual SGP4/TEME/ITRS/AltAz work shared with beam_vs_starlink.py;
-    this function's own job is just writing a CSV row per in-beam sample,
-    alongside the Alt/Az position already computed for the FOV test (so
-    downstream analysis - e.g. Find Busy Times/find_busy.py - doesn't need
-    to re-propagate the TLE to recover it).
+    Run in its own process (see Pool.imap_unordered in __main__), one call
+    per satellite - sat_data is the (name, tle_line1, tle_line2) tuple for
+    that satellite. Thin wrapper around utils.propagate_in_beam(), which
+    does the actual SGP4/TEME/ITRS/AltAz work shared with
+    beam_vs_starlink.py; this function's own job is just writing a CSV row
+    per in-beam sample, alongside the Alt/Az position already computed for
+    the FOV test (so downstream analysis - e.g. Find Busy Times/
+    find_busy.py - doesn't need to re-propagate the TLE to recover it).
+
+    The progress bar (over satellites, not timestamps) lives in the main
+    process wrapping the Pool.imap_unordered call, so this function does no
+    tqdm bookkeeping of its own - see __main__ below.
     """
+    name, tle_line1, tle_line2 = sat_data
     satellite_name = name.strip()
     output_filename = os.path.join(outdir, f"{satellite_name.replace(' ', '_')}_results.csv")
-
-    # Pin this worker's bar to its own terminal line (position) instead of
-    # all pool workers fighting over line 0, which is what garbles the
-    # output when several tqdm bars run in different processes at once.
-    # _identity[0] is the 1-based slot of this process in the Pool.
-    worker_slot = current_process()._identity[0]
-    times = tqdm(night_ts['time'], desc=satellite_name,
-                 position=worker_slot, leave=False, disable=no_progress)
 
     with open(output_filename, 'w') as f:
         # Metadata comment lines (skipped by csv readers/pandas via
@@ -206,15 +204,15 @@ def work_func_sat(name, tle_line1, tle_line2, outdir, no_progress=False):
 
         n_visible = 0
         for _idx, t1, _itrs, altaz, zen_sep in propagate_in_beam(
-            satellite_name, tle_line1, tle_line2, times, hera_location, fov_angular_radius
+            satellite_name, tle_line1, tle_line2, night_ts['time'],
+            hera_location, fov_angular_radius,
         ):
             n_visible += 1
             f.write(f"{t1.iso},{altaz.alt.to_value(units.deg):.6f},"
                     f"{altaz.az.to_value(units.deg):.6f},{zen_sep.to_value(units.deg):.6f}\n")
 
-    # Print progress/result to screen. tqdm.write() (not plain print()) so
-    # this doesn't land mid-line inside another worker's active progress
-    # bar - plain print() isn't aware of tqdm's in-place cursor redraws.
+    # tqdm.write() (not plain print()) so this doesn't land mid-line inside
+    # the main process's satellite-count progress bar.
     if n_visible:
         tqdm.write(f"\nFinished processing {satellite_name}, results in {output_filename}")
     else:
@@ -229,15 +227,19 @@ if __name__ == "__main__":
     os.makedirs(args.outdir, exist_ok=True)
     running_details = os.path.join(args.outdir, "Running_details.txt")
 
-    # Share one lock across worker processes so their tqdm bars (each
-    # pinned to its own line via `position` in work_func_sat) don't
-    # interleave/corrupt each other's terminal writes.
+    # Share one lock across worker processes so their tqdm.write() calls
+    # (satellite-finished messages) don't interleave/corrupt the main
+    # process's satellite-count progress bar below.
     tqdm.set_lock(RLock())
     with Pool(initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),)) as pool:
-        pool.starmap(
-            partial(work_func_sat, outdir=args.outdir, no_progress=args.no_progress),
-            satellites_data,
-        )
+        for _ in tqdm(
+            pool.imap_unordered(
+                partial(work_func_sat, outdir=args.outdir), satellites_data
+            ),
+            total=len(satellites_data), desc="Satellites",
+            disable=args.no_progress,
+        ):
+            pass
 
     # --------------------- Resource usage report -------------------------
     # Wall time, memory and CPU stats for the whole run (self = this
