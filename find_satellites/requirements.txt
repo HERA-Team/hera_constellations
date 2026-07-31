@@ -1,0 +1,6 @@
+astropy
+matplotlib
+numpy
+psutil
+sgp4
+tqdm
