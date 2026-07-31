@@ -81,33 +81,19 @@ def propagate_in_beam(name, tle_line1, tle_line2, times, location, fov_radius,
     """Propagate one satellite across `times` and yield samples inside the beam.
 
     Builds its own SGP4 propagator from the TLE, then for each timestamp in
-    `times` (any iterable of astropy Time objects - a plain array or a
-    tqdm-wrapped one, this function doesn't care) runs the shared physics
-    chain: SGP4 -> TEME -> ITRS -> AltAz, testing whether the result falls
-    within `fov_radius` of `location`'s zenith. SGP4 errors are always
-    silently skipped, matching the two scripts' prior behavior.
+    `times` (iterable of astropy Time objects) runs the conversion: 
+    SGP4 -> TEME -> ITRS -> AltAz, testing whether the result falls
+    within `fov_radius` of `location`'s zenith. 
+    Note: SGP4 errors are silently skipped.
 
     in_beam_only: if True (default), samples outside `fov_radius` of zenith
-    are skipped too, so only true beam crossings are yielded - this is what
-    find_fov_passes.py and beam_vs_starlink.py's default mode rely on. Pass
-    False to yield every sample regardless of beam membership (zen_sep is
-    still computed and returned either way) - used by beam_vs_starlink.py's
-    --all-positions mode to reproduce the old rafas.py behaviour of plotting
-    a satellite's whole track, for comparison against the beam-filtered view.
+    are skipped too, so only true beam crossings are yielded. Pass
+    False to yield every sample regardless of beam membership.
 
-    Note: no tqdm or multiprocessing-position logic here on purpose - that's
-    specific to how each caller runs inside a Pool worker (see their own
-    work_func_sat), and doesn't belong in an otherwise plain, independently
-    testable generator. Wrap `times` in tqdm(...) before passing it in if a
-    progress bar is wanted; enumerate() below works the same either way.
-
-    Yields (idx, t1, itrs, altaz, zen_sep) - idx is the position of t1 in
-    the original `times` sequence (needed by callers that write into a
-    pre-sized array indexed by sample position), itrs/altaz are the
-    corresponding coordinate frame objects (so callers can pull out
-    whatever they specifically need - geodetic position, RA/Dec via a
-    further transform, etc.), and zen_sep is the angular distance from
-    zenith already computed once, rather than recomputed by every caller.
+    Yields (idx, t1, itrs, altaz, zen_sep) 
+    - idx is the position of t1 in the original `times` sequence 
+    - itrs/altaz are the corresponding coordinate frame objects 
+    - zen_sep is the angular distance from zenith
     """
     sat = Satrec.twoline2rv(tle_line1, tle_line2)
 
@@ -126,14 +112,12 @@ def propagate_in_beam(name, tle_line1, tle_line2, times, location, fov_radius,
         teme = TEME(pos.with_differentials(vel), obstime=t1)
         itrs = teme.transform_to(ITRS(obstime=t1))
 
-        # ITRS -> AltAz as seen from `location` specifically (not Earth's
-        # center): a LEO satellite's altitude is a large fraction of
-        # Earth's radius, so its apparent position depends strongly on the
-        # observer's location (topocentric parallax).
+        # ITRS -> AltAz as seen from `location` (not Earth's center).
         altaz = itrs.transform_to(AltAz(obstime=t1, location=location))
 
-        # Angular distance from zenith; inside the FOV disk if within
-        # fov_radius of it.
+        # Angular distance from zenith
+        # inside the FOV disk if within fov_radius of it.
+        # print(altaz.alt.deg)
         zen_sep = 90 * units.deg - altaz.alt
         if in_beam_only and zen_sep > fov_radius:
             continue  # outside the beam - skip
