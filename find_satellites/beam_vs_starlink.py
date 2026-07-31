@@ -76,6 +76,7 @@ from multiprocessing import Pool, RLock   # one worker process per satellite
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib import colors
+from matplotlib.cm     import ScalarMappable
 
 from parameters import hera_location, fov_angular_radius, position_angles
 from utils import (
@@ -165,33 +166,18 @@ def parse_args():
 
 #  Worker Function
 def work_func_sat(sat_data, night_ts, in_beam_only=True):
-    """Propagate one satellite and return the samples of interest.
+    """Propagate one satellite and return the data of interest.
 
-    Run in its own process (see Pool.imap_unordered below), one call per
-    satellite - sat_data is the (name, tle1, tle2) tuple for that
-    satellite. Thin wrapper around utils.propagate_in_beam(), which does
-    the actual SGP4/TEME/ITRS/AltAz work shared with find_fov_passes.py;
-    this function's own job is converting each returned sample to RA/Dec
-    (GCRS, not ICRS - see the import comment above for why) and geodetic
-    position, and collecting the results.
+    Run in its own process per satellite - sat_data is the (name, tle1, 
+    tle2) tuple for that satellite. 
+    
+    Thin wrapper around utils.propagate_in_beam(), which converts each 
+    returned sample to RA/Dec (GCRS, not ICRS) and geodetic position.
 
     in_beam_only: passed straight through to propagate_in_beam() - True
     (default) yields only in-beam samples, False yields every night-time
-    sample regardless of beam membership (--all-positions mode). Either
-    way this just accumulates whatever's yielded directly - no need to
-    pre-size arrays for the full time range. Beam entry/exit times (see
-    below) are tracked from actual beam membership either way, so they
-    don't depend on in_beam_only.
+    sample regardless of beam membership (--all-positions mode). 
 
-    Takes the whole night_ts TimeSeries (not just night_ts['time']) and
-    extracts the column here, inside the worker, after it's been pickled
-    across to this process - a sliced-out mixin column pickles badly (it
-    carries a weakref back to its parent table), while the TimeSeries
-    itself pickles fine.
-
-    The progress bar (over satellites, not timestamps) lives in the main
-    process wrapping the Pool.imap_unordered call, so this function does no
-    tqdm bookkeeping of its own - see __main__ below.
     """
     name, tle1, tle2 = sat_data
     satellite_name = name.strip()
@@ -217,8 +203,21 @@ def work_func_sat(sat_data, night_ts, in_beam_only=True):
                 beam_entry = t1
             beam_exit = t1
 
-        # In-beam: convert to RA/Dec for plotting on the sky.
-        sky = altaz.transform_to(GCRS(obstime=t1))
+        # In-beam: convert to RA/Dec for plotting on the sky. Use only the
+        # alt/az *direction* (no distance) before transforming to GCRS -
+        # GCRS is geocentric, so transforming `altaz` as-is (its real,
+        # finite slant range) would re-centre it on Earth's core, introducing
+        # a large parallax shift for near-Earth objects (slant range
+        # comparable to Earth's radius) that the beam ring doesn't have (it's
+        # built the same way but with no distance, i.e. treated as being at
+        # infinity, like a star). Dropping the distance keeps both directly
+        # comparable: the plotted point ends up at the same fixed-sky
+        # direction that zen_sep already measures topocentrically, rather
+        # than the (parallax-shifted) direction to the satellite's actual 3D
+        # position as seen from Earth's centre.
+        altaz_dir = SkyCoord(alt=altaz.alt, az=altaz.az, frame='altaz',
+                              location=hera_location, obstime=t1)
+        sky = altaz_dir.transform_to(GCRS(obstime=t1))
         loc = itrs.earth_location
 
         heights.append(loc.height.to(units.km).value)
@@ -239,8 +238,6 @@ def work_func_sat(sat_data, night_ts, in_beam_only=True):
             beam_entry, beam_exit)
 
 
-#
-# Main
 if __name__ == "__main__":
     args = parse_args()
 
@@ -254,7 +251,8 @@ if __name__ == "__main__":
 
     # --from-passes-dir narrows things down to a handful of satellites for a
     # close-up window, so default to finer (1 s) cadence than the plain
-    # full-TLE-file case (5 s) - --time-delta still overrides either way.
+    # full-TLE-file case (5 s) 
+    # --time-delta still overrides either way.
     default_time_delta = 1.0 if args.from_passes_dir else 5.0
     time_delta = (args.time_delta if args.time_delta is not None
                   else default_time_delta) * units.s
@@ -272,8 +270,7 @@ if __name__ == "__main__":
             "the Sun is up the whole window. Pick a different --start/--end."
         )
 
-    # TLE file - each satellite is propagated in its own process (Pool),
-    # since the per-satellite work is independent.
+    # TLE file
     sats = read_tle_file(args.tle_file)
     n_total = len(sats)
 
@@ -284,8 +281,7 @@ if __name__ == "__main__":
             raise SystemExit(
                 f"--from-passes-dir {args.from_passes_dir}: no satellite has a "
                 f"recorded pass between {t0.iso} and {t_end.iso}. Check the "
-                "directory is find_fov_passes.py's outdir for this same TLE "
-                "file and time range."
+                "directory or decrease the time interval used to compute positions."
             )
         print(f"--from-passes-dir: {len(sats)}/{n_total} satellites have a "
               f"pass in this window; propagating only those.")
@@ -294,6 +290,7 @@ if __name__ == "__main__":
     # satellite kept above.
     if args.limit is not None:
         sats = sats[:args.limit]
+    sats = [sats[19]]
     print(f"Number of satellites: {len(sats)}")
 
     tqdm.set_lock(RLock())
@@ -316,7 +313,7 @@ if __name__ == "__main__":
         f.write(f"FOV entry/exit times, {t0.iso} to {t_end.iso}\n")
         f.write("=" * 60 + "\n\n")
         f.write(f"{'Satellite':<20}{'First in FOV (UTC)':<27}{'Last in FOV (UTC)':<27}\n")
-        for satname, _lat, _lon, _ra, _dec, _idx, beam_entry, beam_exit in sorted(
+        for satname, _, _, _, _, _, beam_entry, beam_exit in sorted(
             results, key=lambda r: r[0]
         ):
             if beam_entry is None:
@@ -328,18 +325,15 @@ if __name__ == "__main__":
     # Build FoV outline (zenith radius 5 deg) for each time stamp.
     # Centre = HERA's zenith, transformed AltAz -> GCRS the same way satellite
     # positions are (see the import comment for why GCRS, not ICRS), so the
-    # outline lines up with the satellite track frame (using LST directly as
-    # an RA ignores ~20+ years of precession since J2000, which is a
-    # sizeable fraction of a 10 deg FoV).
+    # outline lines up with the satellite track frame (using LST directly).
     fov_ra, fov_dec = [], []
     for t in night_ts['time']:
-        # SkyCoord (not a bare AltAz frame) so .transform_to() below yields a
-        # SkyCoord too - directional_offset_by is a SkyCoord-only method,
-        # not available on plain frame objects.
-        zenith = SkyCoord(alt=90*units.deg, az=0*units.deg, frame='altaz',
-                           location=hera_location, obstime=t)
+        zenith = SkyCoord(
+            alt=90*units.deg, az=0*units.deg, frame='altaz',
+            location=hera_location, obstime=t
+        )
         centre = zenith.transform_to(GCRS(obstime=t))
-        ring   = centre.directional_offset_by(position_angles, fov_angular_radius)
+        ring = centre.directional_offset_by(position_angles, fov_angular_radius)
         fov_ra.append(ring.ra.wrap_at(360*units.deg).deg)
         fov_dec.append(ring.dec.deg)
 
@@ -363,10 +357,23 @@ if __name__ == "__main__":
     locator    = mdates.AutoDateLocator()
     formatter  = mdates.ConciseDateFormatter(locator)
 
-    # FoV polygons
-    for ra_fov, dec_fov in zip(fov_ra, fov_dec):
-        ax.fill(ra_fov, dec_fov, edgecolor='none', alpha=0.009,
-                color="teal", zorder=0)
+    # Normalize & colormap for shared mapping
+    cmap = plt.get_cmap('coolwarm')
+    norm = colors.Normalize(vmin=date_nums.min(), vmax=date_nums.max())
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+
+    # Draw FoV with time‐coded colors
+    for ra_f, dec_f, tn in zip(fov_ra, fov_dec, date_nums):
+        ax.fill(
+            ra_f, dec_f,
+            facecolor=cmap(norm(tn)), edgecolor='none',
+            alpha=0.05, zorder=0
+        )
+    # # FoV polygons
+    # for ra_fov, dec_fov in zip(fov_ra, fov_dec):
+    #     ax.fill(ra_fov, dec_fov, edgecolor='none', alpha=0.009,
+    #             color="teal", zorder=0)
 
     # satellite tracks. Colour by each point's own timestamp (date_nums[idx],
     # not date_nums[:len(ra_arr)] which paired points with the wrong times
@@ -374,12 +381,12 @@ if __name__ == "__main__":
     # cmap/norm across satellites so the colour scale is consistent and the
     # colorbar below doesn't depend on which satellite happens to be plotted
     # last (some have zero in-beam points).
-    cmap = plt.get_cmap('coolwarm')
-    norm = colors.Normalize(vmin=date_nums.min(), vmax=date_nums.max())
-    for satname, lat, lon, ra_arr, dec_arr, idx, _beam_entry, _beam_exit in results:
+    for satname, lat, lon, ra_arr, dec_arr, idx, _, _ in results:
         ax.scatter(ra_arr, dec_arr,
                    c=date_nums[idx], marker='o',
                    cmap=cmap, norm=norm, s=1, lw=1.3, label=satname)
+        if satname in ['ORBCOMM FM 14', 'ORBCOMM FM 21', 'ORBCOMM FM 25', 'ORBCOMM FM 16 DEB']:
+            print(np.mean(ra_arr), np.mean(dec_arr))
 
     # Not 'equal': the RA range covered here (up to ~360 deg, since the
     # night-time filter can produce blocks many hours apart, over which
@@ -398,6 +405,17 @@ if __name__ == "__main__":
     ax.set_title(f"{args.constellation} Passes through HERA FoV{title_suffix}\n"
                  f"{t0.iso} to {t_end.iso}")
     ax.grid(alpha=0.5)
+
+    # Report which satellites actually show up in the cropped view.
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    print(f"Satellites with a track visible in this plot:")
+    for satname, lat, lon, ra_arr, dec_arr, idx, _, _ in results:
+        if len(ra_arr) == 0:
+            continue
+        visible = ((ra_arr >= xlim[0]) & (ra_arr <= xlim[1]) &
+                   (dec_arr >= ylim[0]) & (dec_arr <= ylim[1]))
+        if visible.any():
+            print(f"  {satname}, at RA={np.mean(ra_arr):.1f}deg, dec={np.mean(dec_arr):.1f}deg")
 
     # Shared colorbar built from the cmap/norm used above (rather than from
     # any one satellite's scatter handle), so it doesn't depend on plot order.
