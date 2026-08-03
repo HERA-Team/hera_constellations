@@ -12,6 +12,10 @@ site/beam, not just the hardcoded HERA one in parameters.py.
 
 from pathlib import Path
 
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
 from astropy import units
 from astropy.time import Time
 from astropy.timeseries import TimeSeries
@@ -19,7 +23,7 @@ from astropy.timeseries import TimeSeries
 # ITRS: Earth-fixed frame used as a stepping stone to the topocentric view.
 # AltAz + get_sun: used both for the night-time filter and the FOV test.
 from astropy.coordinates import (
-    TEME, CartesianDifferential, CartesianRepresentation, ITRS, AltAz, get_sun,
+    TEME, CartesianDifferential, CartesianRepresentation, ITRS, AltAz, ICRS, get_sun,
 )
 
 from sgp4.api import Satrec   # SGP4 orbit propagator, reads TLEs
@@ -152,3 +156,111 @@ def satellites_in_window(passes_dir, start_iso, end_iso):
                         names.add(sat_name)
                     break  # one hit is enough for this file
     return names
+
+
+def in_beam_mask(uv, location, fov_radius):
+    """Boolean array, one entry per `uv`'s unique time, for whether its
+    phase center was inside the FOV (within `fov_radius` of `location`'s
+    zenith) at that time.
+
+    Works directly off `uv.phase_center_catalog`, not a TLE or a
+    find_fov_passes.py output directory, by transforming the phase
+    center's own stored apparent position back to AltAz at each time and
+    comparing the zenith separation to `fov_radius`. For an "ephem" phase
+    center built by phasing to a satellite with propagate_in_beam() (e.g.
+    via phase_data/phase_to_satellites.py), this recovers the same zenith
+    separation this module's own propagate_in_beam() would have computed,
+    since that ephemeris keeps only the satellite's topocentric
+    *direction* (no distance) - exactly what's being inverted here.
+
+    Handles a `uv` whose blts are split across more than one phase center
+    (e.g. some samples phased to a satellite, others left at the original
+    "unprojected"/zenith center) by looking up each unique time's own
+    phase center id via `uv.phase_center_id_array`.
+    """
+    unique_jd, unique_idx = np.unique(uv.time_array, return_index=True)
+    cat_ids = uv.phase_center_id_array[unique_idx]
+
+    zensep_deg = np.zeros(unique_jd.shape)
+    for cat_id in np.unique(cat_ids):
+        cat = uv.phase_center_catalog[cat_id]
+        sel = cat_ids == cat_id
+        times = Time(unique_jd[sel], format="jd", scale="utc")
+
+        if cat["cat_type"] == "ephem":
+            # cat_times/cat_lon/cat_lat cover exactly the times this phase
+            # center was applied to, so this interpolation lands on exact
+            # matches, not an approximation.
+            lon = np.interp(unique_jd[sel], cat["cat_times"], cat["cat_lon"])
+            lat = np.interp(unique_jd[sel], cat["cat_times"], cat["cat_lat"])
+        else:
+            lon = np.full(sel.sum(), cat["cat_lon"])
+            lat = np.full(sel.sum(), cat["cat_lat"])
+
+        icrs = ICRS(ra=lon * units.rad, dec=lat * units.rad)
+        altaz = icrs.transform_to(AltAz(obstime=times, location=location))
+        zensep_deg[sel] = (90 * units.deg - altaz.alt).to_value(units.deg)
+
+    return zensep_deg <= fov_radius.to_value(units.deg)
+
+
+def plot_waterfall(uv, location, fov_radius, ant1=None, ant2=None, pol=None,
+                    ax=None, shade_in_beam=True):
+    """Plot a time-vs-frequency amplitude waterfall for one baseline/pol of `uv`.
+
+    If shade_in_beam (default True), the times `uv`'s phase center was
+    actually inside the FOV are hatched - see in_beam_mask() above. For a
+    `uv` phased with in_beam_only=True (find_fov_passes.py's default
+    sense, and phase_data/phase_to_satellites.py's), every sample is
+    in-beam, so the whole plot is hatched; the shading is most
+    informative for a `uv` phased with in_beam_only=False, which also
+    includes samples before/after the FOV crossing.
+
+    ant1/ant2: baseline to plot; defaults to `uv`'s first antenna pair.
+    pol: polarization to plot (str or int, anything uv.get_data() accepts);
+        defaults to `uv`'s first polarization.
+    ax: existing matplotlib Axes to draw on; a new figure is created if
+        not given.
+
+    Returns the Axes drawn on.
+    """
+    if ant1 is None or ant2 is None:
+        ant1, ant2 = uv.get_antpairs()[0]
+    if pol is None:
+        pol = uv.get_pols()[0]
+
+    data = uv.get_data(ant1, ant2, pol)  # (Ntimes, Nfreqs)
+    times = np.unique(uv.time_array)  # matches get_data()'s time ordering
+    freqs_mhz = uv.freq_array / 1e6
+    t_minutes = (times - times[0]) * 24 * 60  # minutes since first sample
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
+
+    im = ax.pcolormesh(freqs_mhz, t_minutes, np.abs(data), shading="nearest")
+    plt.colorbar(im, ax=ax, label="|Visibility|")
+
+    if shade_in_beam:
+        in_beam = in_beam_mask(uv, location, fov_radius)
+        # Hatch each contiguous in-beam run as a horizontal band spanning
+        # the full frequency range, rather than solid-filling it (which
+        # would hide the data underneath).
+        padded = np.concatenate(([0], in_beam.astype(int), [0]))
+        edges = np.flatnonzero(np.diff(padded)).reshape(-1, 2)
+        for start, stop in edges:
+            ax.axhspan(
+                t_minutes[start], t_minutes[stop - 1],
+                facecolor="none", edgecolor="red", hatch="//",
+                linewidth=0, alpha=0.6, zorder=3,
+            )
+        if len(edges):
+            ax.legend(
+                handles=[Patch(facecolor="none", edgecolor="red", hatch="//",
+                                label="in FOV")],
+                fontsize=9, loc="upper right",
+            )
+
+    ax.set_xlabel("Frequency [MHz]")
+    ax.set_ylabel(f"Minutes since {Time(times[0], format='jd', scale='utc').iso}")
+    ax.set_title(f"Waterfall: baseline ({ant1}, {ant2}), pol {pol}")
+    return ax
