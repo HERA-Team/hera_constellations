@@ -238,12 +238,13 @@ def work_func_sat(sat_data, outdir):
         f.write(f"# time_delta_s: {time_delta_s}\n")
         f.write("timestamp,alt_deg,az_deg,zensep_deg\n")
 
-        n_visible = 0
-        for _idx, t1, _itrs, altaz, zen_sep in propagate_in_beam(
-            satellite_name, tle_line1, tle_line2, night_ts['time'],
-            hera_location, fov_angular_radius,
-        ):
-            n_visible += 1
+    n_visible = 0
+    for _, t1, _, altaz, zen_sep in propagate_in_beam(
+        satellite_name, tle_line1, tle_line2, night_ts['time'],
+        hera_location, fov_angular_radius,
+    ):
+        n_visible += 1
+        with open(output_filename, 'a') as f:
             f.write(f"{t1.iso},{altaz.alt.to_value(units.deg):.6f},"
                     f"{altaz.az.to_value(units.deg):.6f},{zen_sep.to_value(units.deg):.6f}\n")
 
@@ -263,13 +264,15 @@ if __name__ == "__main__":
     os.makedirs(args.outdir, exist_ok=True)
     running_details = os.path.join(args.outdir, "Running_details.txt")
 
-    print(f'\nComputing satellite positions over {len(night_ts["time"])} timestamps for each satellite.')
+    print(f'\nComputing satellite positions over {len(night_ts["time"])} timestamps '
+          f'for {len(satellites_data)} satellites.')
 
     # Share one lock across worker processes so their tqdm.write() calls
     # (satellite-finished messages) don't interleave/corrupt the main
     # process's satellite-count progress bar below.
     tqdm.set_lock(RLock())
-    with Pool(initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),)) as pool:
+    n_workers = min(os.cpu_count() or 1, 16)
+    with Pool(n_workers, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),)) as pool:
         for _ in tqdm(
             pool.imap_unordered(
                 partial(work_func_sat, outdir=args.outdir), satellites_data
