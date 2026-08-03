@@ -416,7 +416,8 @@ if __name__ == "__main__":
     for satname, lat, lon, ra_arr, dec_arr, idx, _, _ in results:
         ax.scatter(ra_arr, dec_arr,
                    c=date_nums[idx], marker='o', zorder=10,
-                   cmap=cmap, norm=norm, s=1, lw=1.3, label=satname)
+                   cmap=cmap, norm=norm, s=25, edgecolors='black', linewidths=0.5,
+                   label=satname)
 
     # Not 'equal': the RA range covered here (up to ~360 deg, since the
     # night-time filter can produce blocks many hours apart, over which
