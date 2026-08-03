@@ -1,53 +1,77 @@
 """
 run_pipeline.py
 
-End-to-end pipeline for a single constellation on a single night at HERA:
+End-to-end pipeline for a single constellation, over either a single night
+or a full observing season at HERA - --day and --season are mutually
+exclusive:
 
-    1. Fetch TLEs (fetch_constellation_tles.py) - the archival TLE closest
-       to --date for every satellite in --constellation.
-    2. Find every FOV crossing that night (find_fov_passes.py) - propagates
-       every satellite and records each night-time timestamp it's inside
-       HERA's beam.
-    3. Find the busiest moment (find_busy.py) - the exact timestamp with
-       the most satellites simultaneously in the beam, from step 2's
-       per-satellite results.
+    1. Fetch TLEs (fetch_constellation_tles.py) - one archival TLE snapshot
+       per satellite in --constellation, closest to an anchor date: --day
+       itself for --day, or Jan 1 of the following year for --season
+       (splits the difference across the Sept-Apr season).
+    2. Find every FOV crossing (find_fov_passes.py --day/--season) -
+       propagates every satellite and records each night-time timestamp
+       it's inside HERA's beam, over the one night or the whole season.
+    3. Find the busiest moment, --day (find_busy.py) - the exact timestamp
+       with the most satellites simultaneously in the beam - OR the busiest
+       NIGHT, --season - the single night (across the whole season) with
+       the most satellites passing through the beam at some point. A
+       "night" is always labeled by the UTC date it *starts* on: "busiest
+       night: 2022-11-23" means the interval from dusk on 2022-11-23 to
+       dawn on 2022-11-24 (find_busy.dates_of() defines nights this way
+       specifically so this never gets split across the UTC-midnight
+       boundary that every HERA night straddles).
     4. Plot that busiest window (beam_vs_starlink.py) - RA/Dec trajectories
        of every satellite in the beam during a --window-minutes window
-       centred on the busiest moment from step 3.
+       centred on the busiest moment (--day), or across the *entire*
+       busiest night, dusk to dawn (--season).
 
 All four scripts (plus this one) live together in find_satellites/.
 
 Note step order: this runs find_fov_passes (step 2 above) *before* the
 busiest-window plot, even though "find crossings" reads like a final
-step - the plot needs to know the busiest moment, and that can only come
-from find_fov_passes' per-satellite results. Both deliverables (the full
-set of FOV crossings, and the busiest-window plot) fall out of the same
-run; there's no separate "step 4" propagation.
+step - the plot needs to know the busiest moment/night, and that can only
+come from find_fov_passes' per-satellite results. Both deliverables (the
+full set of FOV crossings, and the busiest-window plot) fall out of the
+same run; there's no separate "step 4" propagation.
 
 Requires a free Space-Track.org account for step 1 - see
 fetch_constellation_tles.py's docstring. Credentials are read from
 SPACETRACK_USER/SPACETRACK_PASS env vars, or prompted for interactively.
 
 Usage:
-    python run_pipeline.py --date 2022-11-13 --constellation Starlink
-    python run_pipeline.py --date 2022-11-13 --constellation Orbcomm \
+    python run_pipeline.py --day 2022-11-13 --constellation Starlink
+    python run_pipeline.py --day 2022-11-13 --constellation Orbcomm \
         --window-minutes 15 --outdir my_runs
+    python run_pipeline.py --season 2022 --constellation Starlink
 
-Outputs, all under --outdir/<constellation>_<date>/ (default outdir:
-Pipeline_runs/ next to this script):
-    tle/<date>_<constellation>_tles.txt   - fetched TLEs (step 1)
-    fov_passes/<SAT>_results.csv          - per-satellite FOV crossings (step 2)
-    fov_passes/Running_details.txt        - run parameters/resource usage (step 2)
+Outputs, all under --outdir/<constellation>_<label>/ (default outdir:
+Pipeline_runs/ next to this script; <label> is the --day date, or
+"season_<YEAR>" for --season):
+    tle/<label>_<constellation>_tles.txt   - fetched TLEs (step 1)
+    fov_passes/<SAT>_results.csv           - per-satellite FOV crossings (step 2)
+    fov_passes/Running_details.txt         - run parameters/resource usage (step 2)
     fov_passes/Time-satellite_correspondence.txt,
-    fov_passes/Busiest_time_positions.txt - find_busy.py's own reference
-                                             outputs (step 3, time-of-day
-                                             aggregated across the CSVs -
-                                             for one night this is one date,
-                                             so equivalent to this run)
-    beam_busiest_window.png               - trajectory plot (step 4)
-    pipeline_summary.txt                  - busiest moment found, satellite
-                                             count there, and paths to all
-                                             of the above
+    fov_passes/Busiest_time_positions.txt  - find_busy.py's own reference
+                                              outputs, --day only (time-of-day
+                                              aggregated across the CSVs -
+                                              for one night this is one date,
+                                              so equivalent to this run)
+    fov_passes/Dates_with_missing_pass.txt,
+    fov_passes/Date-satellite_missing.txt,
+    fov_passes/Busiest_day_positions.txt   - find_busy.py's own reference
+                                              outputs, --season only (busiest-
+                                              night breakdown; "Busiest_day_
+                                              positions.txt" is find_busy.py's
+                                              own filename, but its counting
+                                              is the same night-aware one
+                                              used for busiest_key above)
+    beam_busiest_window_<date>.png         - trajectory plot (step 4); <date>
+                                              is --day, or the busiest night
+                                              found for --season
+    pipeline_summary.txt                   - busiest moment/night found,
+                                              satellite count there, and
+                                              paths to all of the above
 """
 
 import argparse
@@ -93,11 +117,23 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
-        "--date", required=True,
-        help="Date of interest, e.g. 2022-11-13. Both the TLE fetch and the "
-             "FOV-pass search center on the night starting on this date "
-             "(dusk this day to dawn the next).",
+    window = parser.add_mutually_exclusive_group(required=True)
+    window.add_argument(
+        "--day", metavar="YYYY-MM-DD",
+        help="Run the pipeline for a single night: the archival TLE fetch "
+             "and FOV-pass search center on the night starting on this "
+             "date (dusk this day to dawn the next). The busiest MOMENT "
+             "that night is found, and a --window-minutes plot centred on "
+             "it is produced.",
+    )
+    window.add_argument(
+        "--season", type=int, metavar="YEAR",
+        help="Run the pipeline for a full observing season, Sept 1 of "
+             "YEAR to Apr 30 of YEAR+1 (e.g. --season 2022 for "
+             "2022-09-01 - 2023-04-30). TLEs are fetched anchored on Jan 1 "
+             "of YEAR+1. Instead of a busiest moment, the busiest single "
+             "NIGHT across the whole season is found and plotted in full "
+             "(dusk to dawn) - --window-minutes is ignored.",
     )
     parser.add_argument(
         "--constellation", required=True, type=constellation_type,
@@ -106,7 +142,8 @@ def parse_args():
     parser.add_argument(
         "--window-minutes", type=float, default=10.0,
         help="Width, in minutes, of the trajectory-plot window centred on "
-             "the busiest moment found (default: 10).",
+             "the busiest moment found (default: 10). --day mode only; "
+             "--season always plots the entire busiest night.",
     )
     parser.add_argument(
         "--busy-threshold", type=float, default=0.90,
@@ -153,18 +190,39 @@ def read_night_window(running_details_path):
 def main():
     args = parse_args()
 
-    # Validate --date early, before doing any work.
-    Time(args.date, scale="utc")
+    # Validate --day/--season early, before doing any work. The --season
+    # construction mirrors find_fov_passes.py's own t0 for --season
+    # (find_fov_passes.py's Sept-1 Time(...) call), so if this passes,
+    # find_fov_passes.py's own subprocess call won't choke on the same one.
+    if args.day:
+        Time(args.day, scale="utc")
+    else:
+        Time(f"{args.season}-09-01T00:00:00", format="isot", scale="utc")
 
-    run_dir = Path(args.outdir) / f"{args.constellation.lower()}_{args.date}"
+    # label names run_dir/tle_file: the date itself for --day, or
+    # "season_YEAR" for --season (there's no single date to use there).
+    label = args.day if args.day else f"season_{args.season}"
+
+    run_dir = Path(args.outdir) / f"{args.constellation.lower()}_{label}"
     tle_dir = run_dir / "tle"
     fov_dir = run_dir / "fov_passes"
     tle_dir.mkdir(parents=True, exist_ok=True)
     fov_dir.mkdir(parents=True, exist_ok=True)
 
-    tle_file = tle_dir / f"{args.date}_{args.constellation.lower()}_tles.txt"
+    tle_file = tle_dir / f"{label}_{args.constellation.lower()}_tles.txt"
 
     # --- Step 1: fetch TLEs -------------------------------------------------
+    # A single TLE snapshot is fetched regardless of mode - fetch_constellation_tles.py
+    # always keeps just the archival TLE closest to one anchor date. For
+    # --season, that anchor is Jan 1 of the following year (splits the
+    # difference across the Sept-Apr season, rather than anchoring at either
+    # end and leaving the far end of the season badly stale).
+    if args.day:
+        fetch_date = args.day
+    else:
+        fetch_date = f"{args.season + 1}-01-01"
+        print(f"--season {args.season}: TLEs will be fetched anchored on {fetch_date}.")
+
     if os.path.exists(tle_file):
         print("Step 1/4: fetching TLEs from Space-Track")
         print(f"{tle_file} already exists! reading from it...")
@@ -174,34 +232,37 @@ def main():
             [
                 sys.executable, str(FETCH_TLES),
                 "--constellation", args.constellation.upper(),
-                "--date", args.date,
+                "--date", fetch_date,
                 "--window-days", '3.0',
                 "--out", str(tle_file),
             ],
         )
 
-    # --- Step 2: find every FOV crossing that night -------------------------
+    # --- Step 2: find every FOV crossing (one night, or the whole season) --
     fov_cmd = [
         sys.executable, str(FIND_FOV_PASSES),
         str(tle_file),
-        "--day", args.date,
         "--outdir", str(fov_dir),
     ]
+    fov_cmd += ["--day", args.day] if args.day else ["--season", str(args.season)]
     if args.no_progress:
         fov_cmd.append("--no-progress")
-    run_step(
-        "Step 2/4: finding FOV crossings for the night of "
-        f"{args.date} (needed before the busiest moment can be found)",
-        fov_cmd,
-    )
+    if args.day:
+        step2_desc = ("Step 2/4: finding FOV crossings for the night of "
+                      f"{args.day} (needed before the busiest moment can be found)")
+    else:
+        step2_desc = ("Step 2/4: finding FOV crossings across the "
+                      f"{args.season}-{args.season + 1} season (needed before "
+                      "the busiest night can be found)")
+    run_step(step2_desc, fov_cmd)
 
     night_start, night_end = read_night_window(fov_dir / "Running_details.txt")
     if night_start:
-        print(f"Night considered (Sun below horizon at HERA): "
-              f"{night_start} to {night_end} UTC")
+        span_label = "Night considered" if args.day else "Season considered"
+        print(f"{span_label}: {night_start} to {night_end} UTC")
 
-    # --- Step 3: find the busiest moment -------------------------------------
-    print("\n=== Step 3/4: finding the busiest moment ===")
+    # --- Step 3: find the busiest moment (--day) or busiest night (--season) --
+    print(f"\n=== Step 3/4: finding the busiest {'moment' if args.day else 'night'} ===")
 
     original_cwd = os.getcwd()
     os.chdir(fov_dir)
@@ -209,47 +270,88 @@ def main():
         sat_passes = find_busy.read_sat_passes()
         total_sats = len(sat_passes)
 
-        # find_busy.py's own "time" mode aggregates time-of-day *across*
-        # potentially many nights, which isn't quite what we want here: for
-        # a single night, counting by the *full* timestamp (not just
-        # HH:MM:SS) pins down one exact, unambiguous moment instead. Reuses
-        # find_busy.py's generic compute_pass_counts() over full timestamps.
-        sat_pass_timestamps = {
-            sat: {ts for ts, *_ in passes} for sat, passes in sat_passes.items()
-        }
-        pass_counts = find_busy.compute_pass_counts(sat_pass_timestamps)
-        if not pass_counts:
-            raise SystemExit(
-                f"No FOV passes found for any {args.constellation} satellite "
-                f"on the night of {args.date} - nothing to plot."
-            )
-        busiest_count = max(pass_counts.values())
-        busiest_timestamps = sorted(
-            ts for ts, count in pass_counts.items() if count == busiest_count
-        )
-        busiest_ts = busiest_timestamps[0]  # chronologically first if tied
+        if args.day:
+            # find_busy.py's own "time" mode aggregates time-of-day *across*
+            # potentially many nights, which isn't quite what we want here:
+            # for a single night, counting by the *full* timestamp (not
+            # just HH:MM:SS) pins down one exact, unambiguous moment
+            # instead. Reuses find_busy.py's generic compute_pass_counts()
+            # over full timestamps.
+            sat_pass_keys = {
+                sat: {ts for ts, *_ in passes} for sat, passes in sat_passes.items()
+            }
+            pass_counts = find_busy.compute_pass_counts(sat_pass_keys)
+            empty_msg = (f"No FOV passes found for any {args.constellation} "
+                         f"satellite on the night of {args.day} - nothing to plot.")
+        else:
+            # Busiest NIGHT across the season, via find_busy.dates_of() -
+            # which labels a night by the UTC date it starts on (dusk to
+            # dawn), so this and find_busy.run_day_mode()'s own reference
+            # files below always agree on which night is busiest.
+            sat_pass_keys = find_busy.dates_of(sat_passes)
+            pass_counts = find_busy.compute_pass_counts(sat_pass_keys)
+            empty_msg = (f"No FOV passes found for any {args.constellation} "
+                         f"satellite in the {args.season}-{args.season + 1} "
+                         "season - nothing to plot.")
 
-        # Also write find_busy.py's own reference files (busy/sparse
-        # time-of-day breakdown etc.) into fov_dir, for cross-checking.
-        find_busy.run_time_mode(sat_passes, args.busy_threshold)
+        if not pass_counts:
+            raise SystemExit(empty_msg)
+
+        busiest_count = max(pass_counts.values())
+        busiest_keys = sorted(
+            key for key, count in pass_counts.items() if count == busiest_count
+        )
+        busiest_key = busiest_keys[0]  # chronologically/lexicographically first if tied
+
+        # Also write find_busy.py's own reference files, for cross-checking.
+        if args.day:
+            find_busy.run_time_mode(sat_passes, args.busy_threshold)
+        else:
+            find_busy.run_day_mode(sat_passes, args.busy_threshold)
     finally:
         os.chdir(original_cwd)
 
-    print(
-        f"Busiest moment: {busiest_ts} UTC "
-        f"({busiest_count}/{total_sats} satellites in beam"
-        + (f", tied with {len(busiest_timestamps) - 1} other moment(s)"
-           if len(busiest_timestamps) > 1 else "")
-        + ")"
-    )
+    if args.day:
+        print(
+            f"Busiest moment: {busiest_key} UTC "
+            f"({busiest_count}/{total_sats} satellites in beam"
+            + (f", tied with {len(busiest_keys) - 1} other moment(s)"
+               if len(busiest_keys) > 1 else "")
+            + ")"
+        )
+    else:
+        night_after = (Time(busiest_key, scale="utc") + 1 * u.day).strftime("%Y-%m-%d")
+        print(
+            f"Busiest night: {busiest_key} "
+            f"(dusk {busiest_key} to dawn {night_after}) "
+            f"({busiest_count}/{total_sats} satellites in beam"
+            + (f", tied with {len(busiest_keys) - 1} other night(s)"
+               if len(busiest_keys) > 1 else "")
+            + ")"
+        )
 
-    # --- Step 4: plot the busiest window -------------------------------------
-    anchor = Time(busiest_ts, scale="utc")
-    half_window = TimeDelta(args.window_minutes / 2 * u.minute)
-    beam_start = (anchor - half_window).isot
-    beam_end = (anchor + half_window).isot
+    # --- Step 4: plot the busiest window (--day) or entire busiest night (--season) --
+    if args.day:
+        anchor = Time(busiest_key, scale="utc")
+        half_window = TimeDelta(args.window_minutes / 2 * u.minute)
+        beam_start = (anchor - half_window).isot
+        beam_end = (anchor + half_window).isot
+        window_desc = f"the {args.window_minutes:.0f} min window around the busiest moment"
+        plot_date_label = args.day
+    else:
+        # Padded noon-to-noon window for this specific night, same
+        # convention find_fov_passes.py's --day uses - beam_vs_starlink.py's
+        # own internal filter_to_night() (get_sun-based) restricts what's
+        # actually plotted/propagated to real night-time samples, and its
+        # plot title now reports the true (night-filtered) span rather than
+        # this padded request window.
+        day_start = Time(busiest_key, scale="utc")
+        beam_start = (day_start + 12 * u.hour).isot
+        beam_end = (day_start + 36 * u.hour).isot
+        window_desc = f"the entire busiest night ({busiest_key}, dusk to dawn)"
+        plot_date_label = busiest_key
 
-    beam_plot = run_dir / "beam_busiest_window.png"
+    beam_plot = run_dir / f"beam_busiest_window_{plot_date_label}.png"
     beam_cmd = [
         sys.executable, str(BEAM_VS_STARLINK),
         str(tle_file),
@@ -266,26 +368,36 @@ def main():
         beam_cmd += ["--limit", str(args.limit)]
     if args.no_progress:
         beam_cmd.append("--no-progress")
-    run_step(
-        f"Step 4/4: plotting the {args.window_minutes:.0f} min window "
-        f"around the busiest moment",
-        beam_cmd,
-    )
+    run_step(f"Step 4/4: plotting {window_desc}", beam_cmd)
 
     # --- Summary --------------------------------------------------------------
     summary_path = run_dir / "pipeline_summary.txt"
     night_line = (f"{night_start} to {night_end} UTC" if night_start else "unknown")
+
+    if args.day:
+        header = f"Pipeline run: {args.constellation}, night of {args.day}"
+        span_label = "Night considered"
+        busiest_line = (f"Busiest moment:      {busiest_key} UTC "
+                         f"({busiest_count}/{total_sats} satellites in beam)\n")
+        plot_line = (f"Plot window:         {beam_start} to {beam_end} UTC "
+                     f"({args.window_minutes:.0f} min)\n")
+    else:
+        header = f"Pipeline run: {args.constellation}, season {args.season}-{args.season + 1}"
+        span_label = "Season considered"
+        busiest_line = (f"Busiest night:       {busiest_key} "
+                         f"({busiest_count}/{total_sats} satellites in beam)\n")
+        plot_line = "Plot window:         entire busiest night, dusk to dawn " \
+                    "(see plot title for exact bounds)\n"
+
     summary = (
-        f"Pipeline run: {args.constellation}, night of {args.date}\n"
+        f"{header}\n"
         f"{'=' * 60}\n\n"
-        f"Night considered:    {night_line} "
+        f"{span_label}:{' ' * max(1, 20 - len(span_label) - 1)}{night_line} "
         f"(Sun below horizon at HERA)\n"
         f"TLE file:            {tle_file}\n"
         f"FOV-pass CSVs:       {fov_dir}/*_results.csv\n"
-        f"Busiest moment:      {busiest_ts} UTC "
-        f"({busiest_count}/{total_sats} satellites in beam)\n"
-        f"Plot window:         {beam_start} to {beam_end} UTC "
-        f"({args.window_minutes:.0f} min)\n"
+        f"{busiest_line}"
+        f"{plot_line}"
         f"Trajectory plot:     {beam_plot}\n"
     )
     summary_path.write_text(summary)

@@ -4,15 +4,21 @@ find_busy.py
 Combines find_busy_day.py and find_busy_time_point.py: reads every
 "*_results.csv" file in the current directory (produced by
 "Check FOV Passes/find_fov_passes.py") and reports either the
-busiest/quietest calendar DATE across the observation window, or the
+busiest/quietest observing NIGHT across the observation window, or the
 busiest/quietest TIME-OF-DAY (HH:MM:SS, on the script's sampling grid)
 across all nights - whichever mode is chosen on the command line.
 
-A date/time counts as "busy" if at least `--threshold` (default 90%) of
+A night/time counts as "busy" if at least `--threshold` (default 90%) of
 all tracked satellites had an FOV pass on it.
 
-Once the busiest day/time is identified, the script also writes one
-satellite-timestamp-position line per crossing (for the winning day, or
+"day" mode labels each night by the UTC date it starts on: dusk to dawn, so
+e.g. "night of 2022-11-23" spans dusk on 2022-11-23 to dawn on 2022-11-24
+- not the raw UTC calendar date of each timestamp, which would split a
+single physical night's passes across two dates (HERA's night spans
+roughly 16:30-03:30 UTC, straddling midnight).
+
+Once the busiest night/time is identified, the script also writes one
+satellite-timestamp-position line per crossing (for the winning night, or
 every occurrence of the winning time-of-day) to a text file. Positions
 (Alt/Az/zenith separation) are read directly from each satellite's CSV,
 where try_cleanup_change_coord.py already stored them - no re-propagation
@@ -27,17 +33,21 @@ import argparse
 import csv
 import glob
 
+from astropy.time import Time
+from astropy import units as u
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "mode", choices=["day", "time"],
-        help="'day': busiest/quietest calendar date. "
+        help="'day': busiest/quietest observing night, labeled by the UTC "
+             "date it starts on (dusk that day to dawn the next). "
              "'time': busiest/quietest time-of-day across all nights.",
     )
     parser.add_argument(
         "--threshold", type=float, default=0.90,
-        help="Fraction of satellites required for a date/time to count as "
+        help="Fraction of satellites required for a night/time to count as "
              "'busy' (default: 0.90, i.e. 90%%).",
     )
     return parser.parse_args()
@@ -80,8 +90,21 @@ def read_sat_passes():
 
 
 def dates_of(sat_passes):
-    """satellite -> set of calendar dates ("YYYY-MM-DD") it passed on."""
-    return {sat: {ts.split()[0] for ts, *_ in passes} for sat, passes in sat_passes.items()}
+    """satellite -> set of night labels ("YYYY-MM-DD") it had an FOV pass on.
+
+    A night is labeled by the UTC date it starts on - dusk that day to dawn
+    the next - matching how find_fov_passes.py's --day defines one (noon UTC
+    to noon UTC the next day). Shifting each timestamp back 12h before
+    taking its date means passes just before and just after UTC midnight,
+    from the same physical HERA night, land under the same label, instead
+    of splitting one night's passes across two raw calendar dates (which
+    every HERA night would otherwise do, since its ~16:30-03:30 UTC span
+    straddles midnight).
+    """
+    return {
+        sat: {(Time(ts, scale="utc") - 12 * u.hour).iso.split()[0] for ts, *_ in passes}
+        for sat, passes in sat_passes.items()
+    }
 
 
 def times_of(sat_passes):

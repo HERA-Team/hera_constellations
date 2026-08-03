@@ -218,6 +218,7 @@ def work_func_sat(sat_data, outdir):
     satellite_name = name.strip()
     output_filename = os.path.join(outdir, f"{satellite_name.replace(' ', '_')}_results.csv")
     time_delta_s = time_delta.to_value(units.s)
+    print(output_filename)
 
     if not args.overwrite and os.path.exists(output_filename):
         existing_delta_s = None

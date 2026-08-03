@@ -382,7 +382,7 @@ if __name__ == "__main__":
     # last (some have zero in-beam points).
     for satname, lat, lon, ra_arr, dec_arr, idx, _, _ in results:
         ax.scatter(ra_arr, dec_arr,
-                   c=date_nums[idx], marker='o',
+                   c=date_nums[idx], marker='o', zorder=10,
                    cmap=cmap, norm=norm, s=1, lw=1.3, label=satname)
 
     # Not 'equal': the RA range covered here (up to ~360 deg, since the
@@ -399,8 +399,13 @@ if __name__ == "__main__":
     ax.set_xlim(ra_min - 2, ra_max + 2)
     ax.set_ylim(dec_min - 2, dec_max + 2)
     title_suffix = " (all positions, no beam filter)" if args.all_positions else ""
+    # night_ts[0]/[-1] (not t0/t_end): --start/--end is often a deliberately
+    # padded request window (e.g. run_pipeline.py passes a noon-to-noon span
+    # for a --season busiest-night plot) - showing the actual night-filtered
+    # bounds here means the title always reflects what was really plotted,
+    # not the raw, wider request.
     ax.set_title(f"{args.constellation} Passes through HERA FoV{title_suffix}\n"
-                 f"{t0.iso} to {t_end.iso}")
+                 f"{night_ts['time'][0].iso} to {night_ts['time'][-1].iso}")
     ax.grid(alpha=0.5)
 
     # Report which satellites actually show up in the cropped view.
