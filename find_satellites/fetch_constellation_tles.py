@@ -33,10 +33,7 @@ Notes:
       match (e.g. ORBCOMM satellites are typically named "ORBCOMM FM ..."),
       so it could in principle also pick up an oddly-named unrelated
       object; spot-check the output if that matters for your use case.
-    - Debris fragments (OBJECT_NAME ending in " DEB") are skipped: a
-      breakup's fragments each get their own NORAD_CAT_ID but share the
-      same name, and downstream scripts key satellites by name for output
-      filenames/lookups, so keeping them would silently collide.
+    - Debris fragments (OBJECT_NAME ending in " DEB") are skipped.
 """
 
 import argparse
@@ -133,10 +130,7 @@ def is_debris(object_name):
     """True if OBJECT_NAME marks this as a debris fragment (e.g. "... DEB").
 
     Space-Track labels debris from a breakup with the parent satellite's
-    name plus a " DEB" suffix, shared identically across every fragment
-    (each has its own NORAD_CAT_ID, but not its own name) - downstream
-    scripts key satellites by name for output filenames/lookups, so keeping
-    these would silently collide/overwrite each other.
+    name plus a " DEB" suffix, shared identically across every fragment.
     """
     return object_name.strip().upper().endswith(" DEB")
 
