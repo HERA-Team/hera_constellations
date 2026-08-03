@@ -259,7 +259,7 @@ def main():
     night_start, night_end = read_night_window(fov_dir / "Running_details.txt")
     if night_start:
         span_label = "Night considered" if args.day else "Season considered"
-        print(f"{span_label}: {night_start} to {night_end} UTC")
+        print(f"{span_label}:  {night_start} to {night_end} UTC")
 
     # --- Step 3: find the busiest moment (--day) or busiest night (--season) --
     print(f"\n=== Step 3/4: finding the busiest {'moment' if args.day else 'night'} ===")

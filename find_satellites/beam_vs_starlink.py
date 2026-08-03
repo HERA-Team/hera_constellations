@@ -326,6 +326,7 @@ if __name__ == "__main__":
     # positions are (see the import comment for why GCRS, not ICRS), so the
     # outline lines up with the satellite track frame (using LST directly).
     fov_ra, fov_dec = [], []
+    centre_ra_wrapped = []
     for t in night_ts['time']:
         zenith = SkyCoord(
             alt=90*units.deg, az=0*units.deg, frame='altaz',
@@ -333,8 +334,40 @@ if __name__ == "__main__":
         )
         centre = zenith.transform_to(GCRS(obstime=t))
         ring = centre.directional_offset_by(position_angles, fov_angular_radius)
-        fov_ra.append(ring.ra.wrap_at(360*units.deg).deg)
+        centre_ra_wrapped.append(centre.ra.deg)
+        fov_ra.append(ring.ra.deg)  # still wrapped into [0,360) here - fixed below
         fov_dec.append(ring.dec.deg)
+
+    # Make RA continuous (allowed to run past 360 deg or below 0 deg)
+    # instead of wrapping into [0,360): a night's beam drift is one
+    # continuous sweep, but wrap_at(360) folds it back whenever it crosses
+    # the 0/360 seam - which for ax.fill() below means two *adjacent*
+    # vertices of the same ring can land on opposite sides of the seam
+    # (e.g. 359.5 next to 0.3), and matplotlib just draws a straight edge
+    # between them with no concept of the wrap, producing a spurious edge
+    # stretching almost the full width of the plot. Fix: unwrap the (one
+    # value per timestamp) centre RA across the whole night with
+    # np.unwrap - safe since consecutive timestamps are only a tiny
+    # fraction of a degree apart - then re-express every ring's vertices
+    # as a small, always-well-behaved offset from that continuous centre,
+    # rather than trying to patch up each ring's own wrapped vertex loop.
+    centre_ra_wrapped = np.array(centre_ra_wrapped)
+    centre_ra_unwrapped = np.degrees(np.unwrap(np.radians(centre_ra_wrapped)))
+    for i in range(len(fov_ra)):
+        offset = ((fov_ra[i] - centre_ra_wrapped[i] + 180) % 360) - 180
+        fov_ra[i] = centre_ra_unwrapped[i] + offset
+
+    # Satellite RA gets the same treatment, keyed by each point's `idx`
+    # (its position in night_ts, matching centre_ra_wrapped/_unwrapped's own
+    # indexing) - so satellite tracks and the FoV shading share one
+    # continuous RA axis instead of the satellite dots staying wrapped
+    # while the shading doesn't.
+    results = [
+        (satname, lat, lon,
+         centre_ra_unwrapped[idx] + (((ra_arr - centre_ra_wrapped[idx] + 180) % 360) - 180),
+         dec_arr, idx, beam_entry, beam_exit)
+        for satname, lat, lon, ra_arr, dec_arr, idx, beam_entry, beam_exit in results
+    ]
 
     # Night filtering can produce disjoint time blocks (e.g. an early-morning
     # block and a separate evening block), so the FoV drift isn't one
