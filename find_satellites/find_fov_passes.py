@@ -48,6 +48,9 @@ Usage:
                    starts at dusk on Nov 13 and ends at dawn on Nov 14.
     --season YEAR  a full observing season: Sept 1 of YEAR to Apr 30 of
                    YEAR+1, e.g. --season 2022 for 2022-09-01 - 2023-04-30.
+
+    --time-delta overrides the sampling cadence in seconds (default: 5 s
+    for --day, 50 s for --season).
 """
 
 import argparse
@@ -121,6 +124,13 @@ def parse_args():
              "2023-04-30.",
     )
     parser.add_argument(
+        "--time-delta", type=float, default=None,
+        help="Sampling cadence, in seconds. Defaults to 5 s for --day, or "
+             "50 s for --season (needs to be finer than the shortest "
+             "possible FOV pass, as brief as ~7 s for a fast LEO "
+             "satellite, so a pass isn't stepped over between samples).",
+    )
+    parser.add_argument(
         "--no-progress", action="store_true",
         help="Disable the tqdm progress bar over satellites (useful for "
              "Slurm/batch jobs, where in-place redraws just clutter the "
@@ -161,12 +171,13 @@ else:
     t0 = Time(f"{args.season}-09-01T00:00:00", format="isot", scale="utc")
     t_end = Time(f"{args.season + 1}-04-30T23:59:00", format="isot", scale="utc")
 
-# Sampling step - change accordingly. Needs to be finer than the shortest
-# possible pass through the FOV (as brief as ~7 s for a fast LEO satellite)
-# so a pass isn't stepped over between samples.
-time_delta = 50 * units.s
-if args.day:
-    time_delta = 5 * units.s
+# Sampling step - --time-delta overrides; otherwise 5 s for --day or 50 s
+# for --season (needs to be finer than the shortest possible pass through
+# the FOV, as brief as ~7 s for a fast LEO satellite, so a pass isn't
+# stepped over between samples).
+default_time_delta = 5.0 if args.day else 50.0
+time_delta = (args.time_delta if args.time_delta is not None
+              else default_time_delta) * units.s
 
 # Regularly-spaced grid of timestamps across the full window (before any
 # night-time filtering).
@@ -268,8 +279,7 @@ if __name__ == "__main__":
           f'for {len(satellites_data)} satellites.')
 
     # Share one lock across worker processes so their tqdm.write() calls
-    # (satellite-finished messages) don't interleave/corrupt the main
-    # process's satellite-count progress bar below.
+    # don't corrupt the main process's satellite-count progress bar.
     tqdm.set_lock(RLock())
     n_workers = min(os.cpu_count() or 1, 16)
     with Pool(n_workers, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),)) as pool:
