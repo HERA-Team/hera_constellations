@@ -80,10 +80,11 @@ Pipeline_runs/ next to this script; <label> is the --day date, or
                                               satellite count there, and
                                               paths to all of the above
 
-find_busiest_nights.py separately reports the --top N busiest nights from
-an existing fov_passes/ directory (e.g. from a past --season run) without
-re-running the pipeline:
-    python find_busiest_nights.py path/to/fov_passes --top 10
+find_busiest.py separately reports the --top N busiest nights (--season)
+or busiest moments within one night (--day DATE) from an existing
+fov_passes/ directory, without re-running the pipeline:
+    python find_busiest.py path/to/fov_passes --season --top 10
+    python find_busiest.py path/to/fov_passes --day 2022-11-15 --top 5
 """
 
 import argparse
@@ -298,6 +299,17 @@ def main():
             # over full timestamps.
             sat_pass_keys = {
                 sat: {ts for ts, *_ in passes} for sat, passes in sat_passes.items()
+            }
+            # Collapse each satellite's own near-duplicate timestamps (the
+            # same continuous crossing sampled at several consecutive
+            # time_delta steps, e.g. 17:13:25/30/35) into one representative
+            # timestamp per crossing - otherwise one pass inflates
+            # pass_counts/the top-n list with several entries for what's
+            # really a single event.
+            time_delta_s = find_busy.read_time_delta_s()
+            sat_pass_keys = {
+                sat: find_busy.collapse_near_duplicates(keys, time_delta_s)
+                for sat, keys in sat_pass_keys.items()
             }
             pass_counts = find_busy.compute_pass_counts(sat_pass_keys)
             empty_msg = (f"No FOV passes found for any {args.constellation} "

@@ -89,6 +89,49 @@ def read_sat_passes():
     return sat_passes
 
 
+def read_time_delta_s():
+    """Read the time_delta_s recorded by find_fov_passes.py in any one
+    *_results.csv's header comment, from the current directory (every
+    file from the same run carries the same value). Returns None if no
+    CSV has that comment (e.g. an older file that predates it).
+    """
+    for path in sorted(glob.glob("*_results.csv")):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("# time_delta_s:"):
+                    try:
+                        return float(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        return None
+                if not line.startswith("#"):
+                    break
+    return None
+
+
+def collapse_near_duplicates(timestamps, time_delta_s, min_gap_multiples=5):
+    """Collapse one satellite's own timestamps into one per FOV crossing.
+
+    A single continuous pass gets sampled at several consecutive
+    time_delta steps (e.g. 17:13:25, 17:13:30, 17:13:35), which would
+    otherwise count as several separate "busiest moments" for what's
+    really one event. Keeps the first timestamp of each cluster of
+    timestamps whose consecutive gaps are all under
+    min_gap_multiples * time_delta_s. If time_delta_s is None (couldn't
+    be determined), returns the input unchanged.
+    """
+    if time_delta_s is None:
+        return set(timestamps)
+    ts_sorted = sorted(Time(t, scale="utc") for t in timestamps)
+    if not ts_sorted:
+        return set()
+    min_gap = min_gap_multiples * time_delta_s
+    kept = [ts_sorted[0]]
+    for prev, t in zip(ts_sorted, ts_sorted[1:]):
+        if (t - prev).sec >= min_gap:
+            kept.append(t)
+    return {t.iso for t in kept}
+
+
 def dates_of(sat_passes):
     """satellite -> set of night labels ("YYYY-MM-DD") it had an FOV pass on.
 
