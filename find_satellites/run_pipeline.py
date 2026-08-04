@@ -69,9 +69,21 @@ Pipeline_runs/ next to this script; <label> is the --day date, or
     beam_busiest_window_<date>.png         - trajectory plot (step 4); <date>
                                               is --day, or the busiest night
                                               found for --season
+    top<N>_busiest_moments.txt (--day) or
+    top<N>_busiest_nights.txt (--season)   - the --top-n busiest moments/
+                                              nights (default 5, beyond just
+                                              the single one the plot is
+                                              centred on), each with its
+                                              satellite count and which
+                                              satellites were present
     pipeline_summary.txt                   - busiest moment/night found,
                                               satellite count there, and
                                               paths to all of the above
+
+find_busiest_nights.py separately reports the --top N busiest nights from
+an existing fov_passes/ directory (e.g. from a past --season run) without
+re-running the pipeline:
+    python find_busiest_nights.py path/to/fov_passes --top 10
 """
 
 import argparse
@@ -155,6 +167,13 @@ def parse_args():
         help="Cap the number of satellites propagated in the busiest-window "
              "plot (step 4 only; step 2 always covers every satellite in "
              "the fetched TLE file). Default: all satellites.",
+    )
+    parser.add_argument(
+        "--top-n", type=int, default=5,
+        help="How many busiest moments (--day) or busiest nights (--season) "
+             "to report, beyond the single busiest one the plot is centred "
+             "on (default: 5). Written to top<N>_busiest_moments.txt or "
+             "top<N>_busiest_nights.txt in the run directory.",
     )
     parser.add_argument(
         "--outdir", default=str(SCRIPT_DIR / "Pipeline_runs"),
@@ -303,6 +322,14 @@ def main():
         )
         busiest_key = busiest_keys[0]  # chronologically/lexicographically first if tied
 
+        # Top --top-n list (beyond just the single busiest_key the plot is
+        # centred on) - satellites_at() reuses the same sat_pass_keys built
+        # above, so this is consistent with busiest_key regardless of mode.
+        top_n_list = [
+            (key, count, find_busy.satellites_at(sat_pass_keys, {key}))
+            for key, count in find_busy.top_n_busiest(pass_counts, args.top_n)
+        ]
+
         # Also write find_busy.py's own reference files, for cross-checking.
         if args.day:
             find_busy.run_time_mode(sat_passes, args.busy_threshold)
@@ -329,6 +356,29 @@ def main():
                if len(busiest_keys) > 1 else "")
             + ")"
         )
+
+    what = "moments" if args.day else "nights"
+    top_n_path = run_dir / f"top{args.top_n}_busiest_{what}.txt"
+    top_n_lines = [
+        f"Top {len(top_n_list)} busiest {what}, {args.constellation}"
+        + (f", night of {args.day}" if args.day
+           else f", season {args.season}-{args.season + 1}"),
+        "=" * 60,
+        "",
+    ]
+    for rank, (key, count, sats) in enumerate(top_n_list, start=1):
+        if args.day:
+            top_n_lines.append(f"{rank}. {key} UTC: {count}/{total_sats} satellites")
+        else:
+            key_after = (Time(key, scale="utc") + 1 * u.day).strftime("%Y-%m-%d")
+            top_n_lines.append(
+                f"{rank}. {key} (dusk {key} to dawn {key_after}): "
+                f"{count}/{total_sats} satellites"
+            )
+        top_n_lines.append(f"   Satellites: {', '.join(sats)}")
+        top_n_lines.append("")
+    top_n_path.write_text("\n".join(top_n_lines))
+    print(f"Top {args.top_n} busiest {what} saved to {top_n_path}")
 
     # --- Step 4: plot the busiest window (--day) or entire busiest night (--season) --
     if args.day:
@@ -399,6 +449,7 @@ def main():
         f"{busiest_line}"
         f"{plot_line}"
         f"Trajectory plot:     {beam_plot}\n"
+        f"Top {args.top_n} busiest {what}: {top_n_path}\n"
     )
     summary_path.write_text(summary)
     print(f"\n{summary}\nSummary written to {summary_path}")

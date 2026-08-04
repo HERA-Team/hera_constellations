@@ -125,6 +125,17 @@ def compute_pass_counts(sat_pass_map):
     return pass_counts
 
 
+def top_n_busiest(pass_counts, n=5):
+    """Return the n busiest keys from a key -> count map.
+
+    A list of (key, count) tuples, sorted by count descending then by key
+    ascending for ties (chronological order for date/timestamp keys).
+    Works for any pass_counts map regardless of what the keys represent -
+    night labels (dates_of()), full timestamps, or times-of-day (times_of()).
+    """
+    return sorted(pass_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
 def busy_sparse_split(pass_counts, threshold_fraction, total_sats):
     """Split keys into >=threshold ("busy") and <threshold ("sparse") sets."""
     min_required = threshold_fraction * total_sats
