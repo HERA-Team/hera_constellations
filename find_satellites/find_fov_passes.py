@@ -259,13 +259,6 @@ def work_func_sat(sat_data, outdir):
             f.write(f"{t1.iso},{altaz.alt.to_value(units.deg):.6f},"
                     f"{altaz.az.to_value(units.deg):.6f},{zen_sep.to_value(units.deg):.6f}\n")
 
-    # tqdm.write() (not plain print()) so this doesn't land mid-line inside
-    # the main process's satellite-count progress bar.
-    if n_visible:
-        tqdm.write(f"\nFinished processing {satellite_name}, results in {output_filename}")
-    else:
-        tqdm.write(f"\nSatellite {name} does NOT pass through HERA's FOV in this time range.")
-
 
 # ------------------------------- Main -----------------------------------
 
