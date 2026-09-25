@@ -4,25 +4,19 @@ find_busy.py
 Combines find_busy_day.py and find_busy_time_point.py: reads every
 "*_results.csv" file in the current directory (produced by
 "Check FOV Passes/find_fov_passes.py") and reports either the
-busiest/quietest observing NIGHT across the observation window, or the
+busiest/quietest observing night across the observation window, or the
 busiest/quietest TIME-OF-DAY (HH:MM:SS, on the script's sampling grid)
-across all nights - whichever mode is chosen on the command line.
+across all nights.
 
 A night/time counts as "busy" if at least `--threshold` (default 90%) of
 all tracked satellites had an FOV pass on it.
 
-"day" mode labels each night by the UTC date it starts on: dusk to dawn, so
-e.g. "night of 2022-11-23" spans dusk on 2022-11-23 to dawn on 2022-11-24
-- not the raw UTC calendar date of each timestamp, which would split a
-single physical night's passes across two dates (HERA's night spans
-roughly 16:30-03:30 UTC, straddling midnight).
+"day" mode labels each night by the UTC date it starts on: dusk to dawn.
 
 Once the busiest night/time is identified, the script also writes one
 satellite-timestamp-position line per crossing (for the winning night, or
 every occurrence of the winning time-of-day) to a text file. Positions
-(Alt/Az/zenith separation) are read directly from each satellite's CSV,
-where try_cleanup_change_coord.py already stored them - no re-propagation
-needed here.
+(Alt/Az/zenith separation) are read directly from each satellite's CSV.
 
 Usage:
     python find_busy.py day   [--threshold 0.90]
@@ -35,6 +29,8 @@ import glob
 
 from astropy.time import Time
 from astropy import units as u
+
+from utils import night_label
 
 
 def parse_args():
@@ -137,15 +133,16 @@ def dates_of(sat_passes):
 
     A night is labeled by the UTC date it starts on - dusk that day to dawn
     the next - matching how find_fov_passes.py's --day defines one (noon UTC
-    to noon UTC the next day). Shifting each timestamp back 12h before
-    taking its date means passes just before and just after UTC midnight,
-    from the same physical HERA night, land under the same label, instead
-    of splitting one night's passes across two raw calendar dates (which
-    every HERA night would otherwise do, since its ~16:30-03:30 UTC span
-    straddles midnight).
+    to noon UTC the next day). utils.night_label() shifts each timestamp
+    back 12h before taking its date so passes just before and just after
+    UTC midnight, from the same physical HERA night, land under the same
+    label, instead of splitting one night's passes across two raw calendar
+    dates (which every HERA night would otherwise do, since its
+    ~16:30-03:30 UTC span straddles midnight) - shared with
+    utils.propagate_in_beam_daily_tle(), which needs the same convention.
     """
     return {
-        sat: {(Time(ts, scale="utc") - 12 * u.hour).iso.split()[0] for ts, *_ in passes}
+        sat: {night_label(Time(ts, scale="utc")) for ts, *_ in passes}
         for sat, passes in sat_passes.items()
     }
 
