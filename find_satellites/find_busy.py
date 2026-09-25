@@ -132,14 +132,9 @@ def dates_of(sat_passes):
     """satellite -> set of night labels ("YYYY-MM-DD") it had an FOV pass on.
 
     A night is labeled by the UTC date it starts on - dusk that day to dawn
-    the next - matching how find_fov_passes.py's --day defines one (noon UTC
-    to noon UTC the next day). utils.night_label() shifts each timestamp
+    the next. utils.night_label() shifts each timestamp
     back 12h before taking its date so passes just before and just after
-    UTC midnight, from the same physical HERA night, land under the same
-    label, instead of splitting one night's passes across two raw calendar
-    dates (which every HERA night would otherwise do, since its
-    ~16:30-03:30 UTC span straddles midnight) - shared with
-    utils.propagate_in_beam_daily_tle(), which needs the same convention.
+    UTC midnight.
     """
     return {
         sat: {night_label(Time(ts, scale="utc")) for ts, *_ in passes}
