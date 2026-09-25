@@ -132,8 +132,6 @@ def login(opener, user, password):
             body = resp.read().decode()
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Space-Track login request failed: HTTP {exc.code}") from exc
-    # Space-Track returns HTTP 200 even on bad credentials, with a JSON body
-    # like {"Login":"Failed"} - so check the body, not just the status code.
     if "Failed" in body:
         raise RuntimeError(
             "Space-Track login rejected - check SPACETRACK_USER/SPACETRACK_PASS."
@@ -200,25 +198,13 @@ def write_tle_file(records, path):
 
 def run_season_mode(records, args):
     """Write one TLE file per day of the season from an already-fetched set
-    of (debris-filtered) GP history records - pure record processing, no
-    network I/O, so this can be exercised directly with fake records
-    without a live Space-Track session.
+    of (debris-filtered) GP history records.
 
     For each day from Sept 1 args.season to Apr 30 args.season+1 inclusive,
-    picks each satellite's record with EPOCH closest to noon UTC that day -
-    noon, not midnight, since HERA's night spans roughly 16:30-03:30 UTC
-    (close to that night's midpoint), keeping this day label consistent
-    with find_busy.dates_of()'s own dusk-labeled night convention. Space-
-    Track won't necessarily have an observation for every satellite on
-    every single day, so "closest available" can land a few days either
-    side - the same fallback closest_per_satellite() already relies on for
-    --date mode, just applied once per day here instead of once overall.
+    picks each satellite's record with EPOCH closest to noon UTC that day.
 
     Groups records by satellite with precomputed EPOCH Julian dates once,
-    then bisects into each satellite's own sorted list per day, rather
-    than re-scanning every record (as closest_per_satellite() does) once
-    per day - this is what keeps the whole loop roughly
-    O(records log records) instead of O(records * n_days).
+    then bisects into each satellite's own sorted list per day.
     """
     by_norad = {}
     for rec in records:
