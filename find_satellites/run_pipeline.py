@@ -5,13 +5,18 @@ End-to-end pipeline for a single constellation, over either a single night
 or a full observing season at HERA - --day and --season are mutually
 exclusive:
 
-    1. Fetch TLEs (fetch_constellation_tles.py) - one archival TLE snapshot
-       per satellite in --constellation, closest to an anchor date: --day
-       itself for --day, or Jan 1 of the following year for --season
-       (splits the difference across the Sept-Apr season).
+    1. Fetch TLEs (fetch_constellation_tles.py) - for --day, one archival
+       TLE snapshot per satellite in --constellation, closest to that
+       date. For --season, one TLE snapshot per satellite PER DAY across
+       the whole season, so step 2 always propagates each night with a
+       near-epoch TLE instead of one fixed snapshot for the whole 8
+       months (a fixed snapshot loses SGP4 accuracy the further a night
+       is from its epoch, which for HERA's narrow 10 deg beam can flip
+       whether a satellite crosses it at all).
     2. Find every FOV crossing (find_fov_passes.py --day/--season) -
        propagates every satellite and records each night-time timestamp
-       it's inside HERA's beam, over the one night or the whole season.
+       it's inside HERA's beam, over the one night or the whole season
+       (using each night's own daily TLE for --season, via --tle-dir).
     3. Find the busiest moment, --day (find_busy.py) - the exact timestamp
        with the most satellites simultaneously in the beam - OR the busiest
        NIGHT, --season - the single night (across the whole season) with
@@ -48,37 +53,28 @@ Usage:
 Outputs, all under --outdir/<constellation>_<label>/ (default outdir:
 Pipeline_runs/ next to this script; <label> is the --day date, or
 "season_<YEAR>" for --season):
-    tle/<label>_<constellation>_tles.txt   - fetched TLEs (step 1)
+    tle/<label>_<constellation>_tles.txt   - fetched TLEs (step 1), --day only
+    tle/daily/<date>_<constellation>_tles.txt,
+    tle/daily/_SUCCESS                     - one TLE file per day of the
+                                              season (step 1), --season only
     fov_passes/<SAT>_results.csv           - per-satellite FOV crossings (step 2)
     fov_passes/Running_details.txt         - run parameters/resource usage (step 2)
-    fov_passes/Time-satellite_correspondence.txt,
-    fov_passes/Busiest_time_positions.txt  - find_busy.py's own reference
-                                              outputs, --day only (time-of-day
-                                              aggregated across the CSVs -
-                                              for one night this is one date,
-                                              so equivalent to this run)
-    fov_passes/Dates_with_missing_pass.txt,
-    fov_passes/Date-satellite_missing.txt,
-    fov_passes/Busiest_day_positions.txt   - find_busy.py's own reference
-                                              outputs, --season only (busiest-
-                                              night breakdown; "Busiest_day_
-                                              positions.txt" is find_busy.py's
-                                              own filename, but its counting
-                                              is the same night-aware one
-                                              used for busiest_key above)
     beam_busiest_window_<date>.png         - trajectory plot (step 4); <date>
                                               is --day, or the busiest night
                                               found for --season
-    top<N>_busiest_moments.txt (--day) or
-    top<N>_busiest_nights.txt (--season)   - the --top-n busiest moments/
-                                              nights (default 5, beyond just
-                                              the single one the plot is
-                                              centred on), each with its
-                                              satellite count and which
-                                              satellites were present
+    beam_busiest_window_<date>_fov_times.txt
+                                           - each plotted satellite's FOV
+                                              entry/exit times (step 4)
     pipeline_summary.txt                   - busiest moment/night found,
-                                              satellite count there, and
+                                              satellite count there, the
+                                              --top-n busiest moments/nights
+                                              (default 5) with which
+                                              satellites were present, and
                                               paths to all of the above
+
+find_busy.py's own reference files (busy/sparse dates, per-satellite
+positions at the busiest time) are no longer written here - run
+find_busy.py directly on a fov_passes/ directory to get them.
 
 find_busiest.py separately reports the --top N busiest nights (--season)
 or busiest moments within one night (--day DATE) from an existing
@@ -143,8 +139,10 @@ def parse_args():
         "--season", type=int, metavar="YEAR",
         help="Run the pipeline for a full observing season, Sept 1 of "
              "YEAR to Apr 30 of YEAR+1 (e.g. --season 2022 for "
-             "2022-09-01 - 2023-04-30). TLEs are fetched anchored on Jan 1 "
-             "of YEAR+1. Instead of a busiest moment, the busiest single "
+             "2022-09-01 - 2023-04-30). One TLE snapshot per satellite PER "
+             "DAY is fetched, so every night is propagated with its own "
+             "near-epoch TLE instead of one fixed snapshot for the whole "
+             "season. Instead of a busiest moment, the busiest single "
              "NIGHT across the whole season is found and plotted in full "
              "(dusk to dawn) - --window-minutes is ignored.",
     )
@@ -159,11 +157,6 @@ def parse_args():
              "--season always plots the entire busiest night.",
     )
     parser.add_argument(
-        "--busy-threshold", type=float, default=0.90,
-        help="Passed through to find_busy.py's --threshold, used only for "
-             "its own reference output files (default: 0.90).",
-    )
-    parser.add_argument(
         "--limit", type=int, default=None,
         help="Cap the number of satellites propagated in the busiest-window "
              "plot (step 4 only; step 2 always covers every satellite in "
@@ -173,8 +166,8 @@ def parse_args():
         "--top-n", type=int, default=5,
         help="How many busiest moments (--day) or busiest nights (--season) "
              "to report, beyond the single busiest one the plot is centred "
-             "on (default: 5). Written to top<N>_busiest_moments.txt or "
-             "top<N>_busiest_nights.txt in the run directory.",
+             "on (default: 5). Written to pipeline_summary.txt in the run "
+             "directory.",
     )
     parser.add_argument(
         "--outdir", default=str(SCRIPT_DIR / "Pipeline_runs"),
@@ -219,8 +212,9 @@ def main():
     else:
         Time(f"{args.season}-09-01T00:00:00", format="isot", scale="utc")
 
-    # label names run_dir/tle_file: the date itself for --day, or
-    # "season_YEAR" for --season (there's no single date to use there).
+    # label names run_dir (and tle_file, --day only): the date itself for
+    # --day, or "season_YEAR" for --season (there's no single date to use
+    # there - --season uses a whole tle/daily/ directory instead).
     label = args.day if args.day else f"season_{args.season}"
 
     run_dir = Path(args.outdir) / f"{args.constellation.lower()}_{label}"
@@ -229,42 +223,55 @@ def main():
     tle_dir.mkdir(parents=True, exist_ok=True)
     fov_dir.mkdir(parents=True, exist_ok=True)
 
-    tle_file = tle_dir / f"{label}_{args.constellation.lower()}_tles.txt"
+    if args.day:
+        tle_file = tle_dir / f"{label}_{args.constellation.lower()}_tles.txt"
+    else:
+        daily_tle_dir = tle_dir / "daily"
 
     # --- Step 1: fetch TLEs -------------------------------------------------
-    # A single TLE snapshot is fetched regardless of mode - fetch_constellation_tles.py
-    # always keeps just the archival TLE closest to one anchor date. For
-    # --season, that anchor is Jan 1 of the following year (splits the
-    # difference across the Sept-Apr season, rather than anchoring at either
-    # end and leaving the far end of the season badly stale).
     if args.day:
-        fetch_date = args.day
+        if os.path.exists(tle_file):
+            print("Step 1/4: fetching TLEs from Space-Track")
+            print(f"{tle_file} already exists! reading from it...")
+        else:
+            run_step(
+                "Step 1/4: fetching TLEs from Space-Track",
+                [
+                    sys.executable, str(FETCH_TLES),
+                    "--constellation", args.constellation.upper(),
+                    "--date", args.day,
+                    "--window-days", '3.0',
+                    "--out", str(tle_file),
+                ],
+            )
     else:
-        fetch_date = f"{args.season + 1}-01-01"
-        print(f"--season {args.season}: TLEs will be fetched anchored on {fetch_date}.")
-
-    if os.path.exists(tle_file):
-        print("Step 1/4: fetching TLEs from Space-Track")
-        print(f"{tle_file} already exists! reading from it...")
-    else:
-        run_step(
-            "Step 1/4: fetching TLEs from Space-Track",
-            [
-                sys.executable, str(FETCH_TLES),
-                "--constellation", args.constellation.upper(),
-                "--date", fetch_date,
-                "--window-days", '3.0',
-                "--out", str(tle_file),
-            ],
-        )
+        # One TLE snapshot per satellite PER DAY across the season (not one
+        # fixed snapshot for the whole thing) - see the module docstring for
+        # why. The _SUCCESS sentinel (written by fetch_constellation_tles.py
+        # --season only after its full day-loop completes) is a more robust
+        # skip check than looking for specific date files, in case a
+        # previous run was interrupted partway through.
+        if (daily_tle_dir / "_SUCCESS").exists():
+            print("Step 1/4: fetching TLEs from Space-Track")
+            print(f"{daily_tle_dir} already has a complete set of daily TLEs; reusing it...")
+        else:
+            run_step(
+                "Step 1/4: fetching TLEs from Space-Track (one snapshot per day)",
+                [
+                    sys.executable, str(FETCH_TLES),
+                    "--constellation", args.constellation.upper(),
+                    "--season", str(args.season),
+                    "--outdir", str(daily_tle_dir),
+                ],
+            )
 
     # --- Step 2: find every FOV crossing (one night, or the whole season) --
-    fov_cmd = [
-        sys.executable, str(FIND_FOV_PASSES),
-        str(tle_file),
-        "--outdir", str(fov_dir),
-    ]
-    fov_cmd += ["--day", args.day] if args.day else ["--season", str(args.season)]
+    fov_cmd = [sys.executable, str(FIND_FOV_PASSES)]
+    if args.day:
+        fov_cmd += [str(tle_file), "--outdir", str(fov_dir), "--day", args.day]
+    else:
+        fov_cmd += ["--tle-dir", str(daily_tle_dir), "--outdir", str(fov_dir),
+                    "--season", str(args.season)]
     if args.no_progress:
         fov_cmd.append("--no-progress")
     if args.day:
@@ -317,8 +324,8 @@ def main():
         else:
             # Busiest NIGHT across the season, via find_busy.dates_of() -
             # which labels a night by the UTC date it starts on (dusk to
-            # dawn), so this and find_busy.run_day_mode()'s own reference
-            # files below always agree on which night is busiest.
+            # dawn), so this and find_busy.py's own day mode always agree
+            # on which night is busiest.
             sat_pass_keys = find_busy.dates_of(sat_passes)
             pass_counts = find_busy.compute_pass_counts(sat_pass_keys)
             empty_msg = (f"No FOV passes found for any {args.constellation} "
@@ -341,12 +348,6 @@ def main():
             (key, count, find_busy.satellites_at(sat_pass_keys, {key}))
             for key, count in find_busy.top_n_busiest(pass_counts, args.top_n)
         ]
-
-        # Also write find_busy.py's own reference files, for cross-checking.
-        if args.day:
-            find_busy.run_time_mode(sat_passes, args.busy_threshold)
-        else:
-            find_busy.run_day_mode(sat_passes, args.busy_threshold)
     finally:
         os.chdir(original_cwd)
 
@@ -369,15 +370,10 @@ def main():
             + ")"
         )
 
+    # Top --top-n list, printed here and written into pipeline_summary.txt
+    # below (not a separate file).
     what = "moments" if args.day else "nights"
-    top_n_path = run_dir / f"top{args.top_n}_busiest_{what}.txt"
-    top_n_lines = [
-        f"Top {len(top_n_list)} busiest {what}, {args.constellation}"
-        + (f", night of {args.day}" if args.day
-           else f", season {args.season}-{args.season + 1}"),
-        "=" * 60,
-        "",
-    ]
+    top_n_lines = [f"Top {len(top_n_list)} busiest {what}:", ""]
     for rank, (key, count, sats) in enumerate(top_n_list, start=1):
         if args.day:
             top_n_lines.append(f"{rank}. {key} UTC: {count}/{total_sats} satellites")
@@ -389,8 +385,8 @@ def main():
             )
         top_n_lines.append(f"   Satellites: {', '.join(sats)}")
         top_n_lines.append("")
-    top_n_path.write_text("\n".join(top_n_lines))
-    print(f"Top {args.top_n} busiest {what} saved to {top_n_path}")
+    top_n_text = "\n".join(top_n_lines)
+    print(f"\n{top_n_text}")
 
     # --- Step 4: plot the busiest window (--day) or entire busiest night (--season) --
     if args.day:
@@ -413,10 +409,23 @@ def main():
         window_desc = f"the entire busiest night ({busiest_key}, dusk to dawn)"
         plot_date_label = busiest_key
 
+    if args.day:
+        plot_tle_file = tle_file
+    else:
+        # The busiest night's own daily TLE (already fetched in step 1, no
+        # extra network call needed) - same epoch-freshness accuracy
+        # benefit --day mode already had, rather than reusing one TLE
+        # snapshot for the whole season.
+        plot_tle_file = daily_tle_dir / f"{busiest_key}_{args.constellation.lower()}_tles.txt"
+        if not plot_tle_file.exists():
+            raise SystemExit(
+                f"{plot_tle_file} not found - check step 1's {daily_tle_dir}."
+            )
+
     beam_plot = run_dir / f"beam_busiest_window_{plot_date_label}.png"
     beam_cmd = [
         sys.executable, str(BEAM_VS_STARLINK),
-        str(tle_file),
+        str(plot_tle_file),
         "--start", beam_start,
         "--end", beam_end,
         "--constellation", args.constellation,
@@ -443,6 +452,7 @@ def main():
                          f"({busiest_count}/{total_sats} satellites in beam)\n")
         plot_line = (f"Plot window:         {beam_start} to {beam_end} UTC "
                      f"({args.window_minutes:.0f} min)\n")
+        tle_line = f"TLE file:            {tle_file}\n"
     else:
         header = f"Pipeline run: {args.constellation}, season {args.season}-{args.season + 1}"
         span_label = "Season considered"
@@ -450,18 +460,20 @@ def main():
                          f"({busiest_count}/{total_sats} satellites in beam)\n")
         plot_line = "Plot window:         entire busiest night, dusk to dawn " \
                     "(see plot title for exact bounds)\n"
+        tle_line = (f"Daily TLE dir:       {daily_tle_dir}\n"
+                    f"TLE used for plot:   {plot_tle_file}\n")
 
     summary = (
         f"{header}\n"
         f"{'=' * 60}\n\n"
         f"{span_label}:{' ' * max(1, 20 - len(span_label) - 1)}{night_line} "
         f"(Sun below horizon at HERA)\n"
-        f"TLE file:            {tle_file}\n"
+        f"{tle_line}"
         f"FOV-pass CSVs:       {fov_dir}/*_results.csv\n"
         f"{busiest_line}"
         f"{plot_line}"
         f"Trajectory plot:     {beam_plot}\n"
-        f"Top {args.top_n} busiest {what}: {top_n_path}\n"
+        f"\n{top_n_text}"
     )
     summary_path.write_text(summary)
     print(f"\n{summary}\nSummary written to {summary_path}")
