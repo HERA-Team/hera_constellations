@@ -2,13 +2,11 @@
 find_fov_passes.py
 
 Batch FOV-pass finder: reads a file of many satellites' TLEs, propagates
-each one (in its own worker process) with SGP4 across a given observation
+each one with SGP4 across a given observation
 window, restricted to night-time hours at HERA (Sun below the local
 horizon), and writes out every UTC timestamp at which the satellite is
-inside HERA's field of view (FOV) - a circular disk of angular radius
-`fov_angular_radius` centred on HERA's zenith (HERA is a drift-scan
-telescope, so its beam center just sits at zenith and drifts across the
-sky in RA as Earth rotates).
+inside HERA's field of view, taken to be a circular disk of angular radius
+`fov_angular_radius` centred on HERA's zenith.
 
 Outputs (written to --outdir, the current working directory by default):
     - <SATELLITE_NAME>_results.csv: a few '#'-prefixed comment lines
@@ -17,80 +15,70 @@ Outputs (written to --outdir, the current working directory by default):
       HERA's FOV: timestamp,alt_deg,az_deg,zensep_deg (zensep = angular
       distance from HERA's zenith). No rows means the satellite never
       passed through the FOV in this time range. One independent file per
-      satellite (rather than one shared file/dataframe) so a worker crash
-      or job preemption only loses that satellite's output.
-
+      satellite.
       If a satellite's CSV already exists and was generated with the same
       time_delta this run would use, it's skipped rather than
-      re-propagated (a re-run after a crash/preemption only redoes the
-      missing ones) - pass --overwrite to force recomputation regardless.
+      re-propagated. Pass --overwrite to force recomputation regardless.
+
     - Running_details.txt: the run's physical parameters (time range, FOV,
-      time step, HERA location - shared by every satellite, so recorded
-      once here rather than repeated in every file), plus wall-clock time,
-      peak memory (RSS) and other resource-usage stats for the whole run
-      (useful for batch/cluster jobs where you need to check --time/--mem
-      requests).
+      time step, HERA location), plus wall-clock time,
+      peak memory (RSS) and other resource-usage stats for the whole run.
 
 Usage:
     python find_fov_passes.py [tle_file] --day 2022-11-13 [--outdir OUTDIR]
     python find_fov_passes.py [tle_file] --season 2022 [--outdir OUTDIR]
+    python find_fov_passes.py --tle-dir DAILY_TLE_DIR --season 2022 [--outdir OUTDIR]
 
     tle_file defaults to "tle_sample.txt" in the current directory if not
     given. It must list satellites in the standard 3-line format (name,
     TLE line 1, TLE line 2), blank lines are ignored - see
     utils.read_tle_file().
+
     --outdir defaults to the current directory, and is created if missing.
 
-    Exactly one of --day/--season is required, to set the observation
-    window (both are then restricted to night-time, Sun below horizon, by
-    the code below):
+    Two options:
     --day DATE     a single night: e.g. --day 2022-11-13 covers the night that
                    starts at dusk on Nov 13 and ends at dawn on Nov 14.
     --season YEAR  a full observing season: Sept 1 of YEAR to Apr 30 of
                    YEAR+1, e.g. --season 2022 for 2022-09-01 - 2023-04-30.
+
+    --tle-dir DIR replaces the single tle_file with a directory of daily
+    TLE files in the --season mode. Each
+    satellite is propagated with its own closest-available TLE per night.
 
     --time-delta overrides the sampling cadence in seconds (default: 5 s
     for --day, 50 s for --season).
 """
 
 import argparse
+import glob
 import os
+import re
 import time
 import psutil
 import resource
 from functools import partial
+from pathlib import Path
 
 from astropy.time import Time
 from astropy import units
 
-from tqdm import tqdm         # progress bar over satellites
+from tqdm import tqdm
 
 from multiprocessing import Pool, RLock, current_process
 
 from parameters import hera_lat, hera_lon, hera_alt, hera_location, fov_angular_radius
-from utils import read_tle_file, make_time_grid, filter_to_night, propagate_in_beam
+from utils import (
+    read_tle_file, make_time_grid, filter_to_night, propagate_in_beam,
+    propagate_in_beam_daily_tle,
+)
 
 start = time.time()
-
-# multiprocessing.Pool (spawn start method, the macOS/Windows default)
-# re-imports this whole file in every worker process, re-running all
-# module-level code below - including this print and the "Observation time
-# considered" block further down. night_ts etc. genuinely need to be
-# recomputed in each worker (that's why they're at module level rather than
-# behind `if __name__ == "__main__"`), but printing about it doesn't - so
-# gate the prints on being the original process, not a spawned worker, to
-# avoid one copy of this output per worker.
 is_main_process = current_process().name == "MainProcess"
 
 if is_main_process:
     print("Start running code")
 
-
-# --------------------------- Argument parsing ---------------------------
-# Parsed up front (rather than only inside `if __name__ == "__main__"`)
-# because --day/--season feed directly into the Global parameters section
-# below, which needs to run at import time (night_ts etc. are module-level
-# globals the worker function relies on).
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -99,10 +87,16 @@ def parse_args():
                      "position at which each one is inside HERA's FOV.",
     )
     parser.add_argument(
-        "tle_file", nargs="?", default="tle_sample.txt",
+        "tle_file", nargs="?", default=None,
         help="TLE file listing satellites in the standard 3-line format "
              "(name, TLE line 1, TLE line 2), blank lines ignored. "
-             "Defaults to 'tle_sample.txt' in the current directory.",
+             "Defaults to 'tle_sample.txt' in the current directory. "
+             "Mutually exclusive with --tle-dir.",
+    )
+    parser.add_argument(
+        "--tle-dir", default=None, metavar="DIR",
+        help="Directory of daily TLE files (one <date>_<constellation>_"
+             "tles.txt per day) in --season mode only.",
     )
     parser.add_argument(
         "--outdir", default=".",
@@ -113,9 +107,7 @@ def parse_args():
     window = parser.add_mutually_exclusive_group(required=True)
     window.add_argument(
         "--day", metavar="YYYY-MM-DD",
-        help="Restrict to the single night starting on this date: noon UTC "
-             "on DATE to noon UTC the next day (the night-time filter below "
-             "then picks out the actual dusk-to-dawn span within that).",
+        help="Restrict to the single night starting on this date.",
     )
     window.add_argument(
         "--season", type=int, metavar="YEAR",
@@ -126,44 +118,40 @@ def parse_args():
     parser.add_argument(
         "--time-delta", type=float, default=None,
         help="Sampling cadence, in seconds. Defaults to 5 s for --day, or "
-             "50 s for --season (needs to be finer than the shortest "
-             "possible FOV pass, as brief as ~7 s for a fast LEO "
-             "satellite, so a pass isn't stepped over between samples).",
+             "50 s for --season.",
     )
     parser.add_argument(
         "--no-progress", action="store_true",
-        help="Disable the tqdm progress bar over satellites (useful for "
-             "Slurm/batch jobs, where in-place redraws just clutter the "
-             "log file).",
+        help="Disable the tqdm progress bar over satellites.",
     )
     parser.add_argument(
         "--overwrite", action="store_true",
         help="Recompute every satellite even if its <SAT>_results.csv "
              "already exists with a matching time_delta. By default, a "
              "satellite is skipped (not re-propagated) if its results file "
-             "is already there and was generated with the same time_delta "
-             "this run would use - only a missing file or a time_delta "
-             "mismatch (e.g. --day vs --season, which use different "
-             "cadences) triggers recomputation.",
+             "is already there.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.tle_dir and args.day:
+        parser.error("--tle-dir requires --season, not --day.")
+    if args.tle_dir and args.tle_file is not None:
+        parser.error("cannot combine a positional tle_file with --tle-dir.")
+    if not args.tle_dir and args.tle_file is None:
+        args.tle_file = "tle_sample.txt"  # restore the old default
+
+    return args
 
 
 args = parse_args()
 
 
 # ------------------------- Global parameters -------------------------
-# hera_lat/hera_lon/hera_alt/hera_location and fov_angular_radius come from
-# parameters.py - the single source of truth shared with beam_vs_starlink.py,
-# rather than a second hand-copied block kept in sync manually.
 
-# Observation time range, from --day or --season (mutually exclusive,
-# exactly one required - see parse_args above).
+# Observation time range
 if args.day:
     # Noon-to-noon UTC around the requested date, so the single actual
-    # night (dusk on --day to dawn the next day) falls entirely inside it
-    # regardless of HERA's small UTC offset - the night-time filter below
-    # then trims this down to the real dusk-to-dawn span.
+    # night falls entirely inside it.
     day_start = Time(args.day, scale="utc")
     t0 = day_start + 12 * units.hour
     t_end = day_start + 36 * units.hour
@@ -186,14 +174,28 @@ ts = make_time_grid(t0, t_end, time_delta)
 # Filter to only night-time samples (Sun below the local horizon at HERA).
 night_ts = filter_to_night(ts, hera_location)
 
-# night_ts is already time-ordered (built from a mask over the sorted `ts`
-# grid), so its first/last entries are the actual dusk/dawn bounds - a
-# tighter, more meaningful range than the padded t0/t_end window above.
 if is_main_process:
     print(f"\nObservation time considered (night-time only, Sun below horizon on site): "
           f"\nfrom {night_ts['time'][0].iso} \nto {night_ts['time'][-1].iso}")
     print("\nFOV of HERA:", fov_angular_radius*2.)
     print(f"\nTime delta: {time_delta} ")
+
+# --tle-dir: one TLE file per day instead of a single tle_file.
+if args.tle_dir:
+    tle_by_sat = {}
+    for path in sorted(glob.glob(os.path.join(args.tle_dir, "*_tles.txt"))):
+        match = re.match(r"^(\d{4}-\d{2}-\d{2})_", os.path.basename(path))
+        if not match:
+            print(f"Warning: {path} doesn't match <date>_<constellation>_tles.txt; skipping.")
+            continue
+        date_str = match.group(1)
+        for name, tle_line1, tle_line2 in read_tle_file(path):
+            tle_by_sat.setdefault(name.strip(), {})[date_str] = (tle_line1, tle_line2)
+    if is_main_process:
+        print(f"\n--tle-dir {args.tle_dir}: {len(tle_by_sat)} satellites across "
+              f"{len(glob.glob(os.path.join(args.tle_dir, '*_tles.txt')))} daily TLE files.")
+else:
+    tle_by_sat = None
 
 
 # ------------------------------ Worker ---------------------------------
@@ -201,59 +203,64 @@ if is_main_process:
 def work_func_sat(sat_data, outdir):
     """Propagate one satellite and write every in-FOV timestamp + position to a CSV file.
 
-    Run in its own process (see Pool.imap_unordered in __main__), one call
-    per satellite - sat_data is the (name, tle_line1, tle_line2) tuple for
-    that satellite. Thin wrapper around utils.propagate_in_beam(), which
-    does the actual SGP4/TEME/ITRS/AltAz work shared with
-    beam_vs_starlink.py; this function's own job is just writing a CSV row
-    per in-beam sample, alongside the Alt/Az position already computed for
-    the FOV test (so downstream analysis - e.g. Find Busy Times/
-    find_busy.py - doesn't need to re-propagate the TLE to recover it).
+    Run in its own process, one call per satellite.
 
-    The progress bar (over satellites, not timestamps) lives in the main
-    process wrapping the Pool.imap_unordered call, so this function does no
-    tqdm bookkeeping of its own - see __main__ below.
     """
-    name, tle_line1, tle_line2 = sat_data
+    if args.tle_dir:
+        name = sat_data
+        tle_by_date = tle_by_sat.get(name, {})
+    else:
+        name, tle_line1, tle_line2 = sat_data
     satellite_name = name.strip()
     output_filename = os.path.join(outdir, f"{satellite_name.replace(' ', '_')}_results.csv")
     time_delta_s = time_delta.to_value(units.s)
+    # A single TLE pair doesn't mean anything in --tle-dir mode.
+    expected_tle_source = str(Path(args.tle_dir).resolve()) if args.tle_dir else None
 
     if not args.overwrite and os.path.exists(output_filename):
         existing_delta_s = None
+        existing_tle_source = None
         with open(output_filename) as f:
             for line in f:
+                if not line.startswith("#"):
+                    break  # comment header always comes first; nothing more to find
                 if line.startswith("# time_delta_s:"):
                     try:
                         existing_delta_s = float(line.split(":", 1)[1].strip())
                     except ValueError:
                         pass
-                    break
-                if not line.startswith("#"):
-                    break  # comment header always comes first; nothing more to find
-        if existing_delta_s is not None and existing_delta_s == time_delta_s:
+                elif line.startswith("# tle_source:"):
+                    existing_tle_source = line.split(":", 1)[1].strip()
+        if existing_delta_s == time_delta_s and existing_tle_source == expected_tle_source:
             tqdm.write(f"\nSkipping {satellite_name}: {output_filename} already exists "
-                       f"with matching time_delta={existing_delta_s} s (use --overwrite to force).")
+                       f"with matching time_delta={existing_delta_s} s and TLE source "
+                       "(use --overwrite to force).")
             return
 
     with open(output_filename, 'w') as f:
-        # Metadata comment lines (skipped by csv readers/pandas via
-        # comment='#'); run-wide parameters live in Running_details.txt
-        # instead of being repeated in every satellite's file. time_delta_s
-        # is recorded so a re-run can tell whether an existing file was
-        # generated at the same cadence (see the skip check above) rather
-        # than blindly reusing/overwriting it.
+        # Metadata comment lines
         f.write(f"# satellite: {satellite_name}\n")
-        f.write(f"# tle_line1: {tle_line1}\n")
-        f.write(f"# tle_line2: {tle_line2}\n")
+        if args.tle_dir:
+            f.write(f"# tle_source: {expected_tle_source}\n")
+        else:
+            f.write(f"# tle_line1: {tle_line1}\n")
+            f.write(f"# tle_line2: {tle_line2}\n")
         f.write(f"# time_delta_s: {time_delta_s}\n")
         f.write("timestamp,alt_deg,az_deg,zensep_deg\n")
 
+    if args.tle_dir:
+        crossings = propagate_in_beam_daily_tle(
+            satellite_name, tle_by_date, night_ts['time'],
+            hera_location, fov_angular_radius,
+        )
+    else:
+        crossings = propagate_in_beam(
+            satellite_name, tle_line1, tle_line2, night_ts['time'],
+            hera_location, fov_angular_radius,
+        )
+
     n_visible = 0
-    for _, t1, _, altaz, zen_sep in propagate_in_beam(
-        satellite_name, tle_line1, tle_line2, night_ts['time'],
-        hera_location, fov_angular_radius,
-    ):
+    for _, t1, _, altaz, zen_sep in crossings:
         n_visible += 1
         with open(output_filename, 'a') as f:
             f.write(f"{t1.iso},{altaz.alt.to_value(units.deg):.6f},"
@@ -263,7 +270,7 @@ def work_func_sat(sat_data, outdir):
 # ------------------------------- Main -----------------------------------
 
 if __name__ == "__main__":
-    satellites_data = read_tle_file(args.tle_file)
+    satellites_data = sorted(tle_by_sat) if args.tle_dir else read_tle_file(args.tle_file)
 
     os.makedirs(args.outdir, exist_ok=True)
     running_details = os.path.join(args.outdir, "Running_details.txt")
@@ -287,8 +294,7 @@ if __name__ == "__main__":
 
     # --------------------- Resource usage report -------------------------
     # Wall time, memory and CPU stats for the whole run (self = this
-    # process, children = the worker pool) - handy for checking batch/HPC
-    # --time= and --mem= requests.
+    # process, children = the worker pool)
     proc = psutil.Process(os.getpid())
     usage_self = resource.getrusage(resource.RUSAGE_SELF)
     usage_ch = resource.getrusage(resource.RUSAGE_CHILDREN)
