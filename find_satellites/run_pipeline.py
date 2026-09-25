@@ -2,47 +2,32 @@
 run_pipeline.py
 
 End-to-end pipeline for a single constellation, over either a single night
-or a full observing season at HERA - --day and --season are mutually
+or a full observing season at HERA location. --day and --season are mutually
 exclusive:
 
-    1. Fetch TLEs (fetch_constellation_tles.py) - for --day, one archival
+    1. Fetch TLEs (fetch_constellation_tles.py). For --day, one archival
        TLE snapshot per satellite in --constellation, closest to that
        date. For --season, one TLE snapshot per satellite PER DAY across
-       the whole season, so step 2 always propagates each night with a
-       near-epoch TLE instead of one fixed snapshot for the whole 8
-       months (a fixed snapshot loses SGP4 accuracy the further a night
-       is from its epoch, which for HERA's narrow 10 deg beam can flip
-       whether a satellite crosses it at all).
-    2. Find every FOV crossing (find_fov_passes.py --day/--season) -
+       the whole season.
+    2. Find every FOV crossing (find_fov_passes.py --day/--season):
        propagates every satellite and records each night-time timestamp
        it's inside HERA's beam, over the one night or the whole season
        (using each night's own daily TLE for --season, via --tle-dir).
-    3. Find the busiest moment, --day (find_busy.py) - the exact timestamp
-       with the most satellites simultaneously in the beam - OR the busiest
-       NIGHT, --season - the single night (across the whole season) with
+    3. Find the busiest moment. For --day (find_busy.py), that is the exact timestamp
+       with the most satellites simultaneously in the beam. For --season,
+       that is the single night (across the whole season) with
        the most satellites passing through the beam at some point. A
-       "night" is always labeled by the UTC date it *starts* on: "busiest
+       "night" is always labeled by the UTC date it *tarts on: "busiest
        night: 2022-11-23" means the interval from dusk on 2022-11-23 to
-       dawn on 2022-11-24 (find_busy.dates_of() defines nights this way
-       specifically so this never gets split across the UTC-midnight
-       boundary that every HERA night straddles).
-    4. Plot that busiest window (beam_vs_starlink.py) - RA/Dec trajectories
+       dawn on 2022-11-24.
+    4. Plot that busiest window (beam_vs_starlink.py) that is RA/Dec trajectories
        of every satellite in the beam during a --window-minutes window
-       centred on the busiest moment (--day), or across the *entire*
-       busiest night, dusk to dawn (--season).
+       centred on the busiest moment/night.
 
 All four scripts (plus this one) live together in find_satellites/.
 
-Note step order: this runs find_fov_passes (step 2 above) *before* the
-busiest-window plot, even though "find crossings" reads like a final
-step - the plot needs to know the busiest moment/night, and that can only
-come from find_fov_passes' per-satellite results. Both deliverables (the
-full set of FOV crossings, and the busiest-window plot) fall out of the
-same run; there's no separate "step 4" propagation.
-
-Requires a free Space-Track.org account for step 1 - see
-fetch_constellation_tles.py's docstring. Credentials are read from
-SPACETRACK_USER/SPACETRACK_PASS env vars, or prompted for interactively.
+Requires a free Space-Track.org account for step 1: see
+fetch_constellation_tles.py's docstring. 
 
 Usage:
     python run_pipeline.py --day 2022-11-13 --constellation Starlink
@@ -72,9 +57,6 @@ Pipeline_runs/ next to this script; <label> is the --day date, or
                                               satellites were present, and
                                               paths to all of the above
 
-find_busy.py's own reference files (busy/sparse dates, per-satellite
-positions at the busiest time) are no longer written here - run
-find_busy.py directly on a fov_passes/ directory to get them.
 
 find_busiest.py separately reports the --top N busiest nights (--season)
 or busiest moments within one night (--day DATE) from an existing
@@ -240,7 +222,6 @@ def main():
                     sys.executable, str(FETCH_TLES),
                     "--constellation", args.constellation.upper(),
                     "--date", args.day,
-                    "--window-days", '3.0',
                     "--out", str(tle_file),
                 ],
             )
