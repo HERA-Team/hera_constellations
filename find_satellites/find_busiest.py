@@ -1,29 +1,13 @@
 """
 find_busiest.py
 
-Scans an existing fov_passes directory (produced by find_fov_passes.py, or
-by run_pipeline.py's fov_passes/ subdirectory - a directory of
+Scans an existing fov_passes directory (a directory of
 <SAT>_results.csv files) and reports either:
-    --season    the N busiest observing NIGHTS in the directory (default
-                if neither --season nor --day is given) - the nights with
-                the most satellites simultaneously crossing HERA's FOV at
-                some point.
-    --day DATE  the N busiest MOMENTS within one specific night (dusk on
-                DATE to dawn the next day) - the exact timestamps with the
-                most satellites simultaneously in the beam.
+    --season    the N busiest observing nights in the directory
+    --day DATE  the N busiest moments within one specific night.
 
 A night is labeled by the UTC date it starts on - dusk that day to dawn
-the next - using find_busy.dates_of()'s night-aware grouping, the same one
-run_pipeline.py's --season mode uses to find the single busiest night, so
---season results here are directly consistent with a run_pipeline.py
---season run over the same fov_passes directory.
-
---day mode collapses each satellite's own near-duplicate timestamps (the
-same continuous crossing sampled at several consecutive time_delta steps)
-into one representative timestamp per crossing first, via
-find_busy.collapse_near_duplicates() - matching run_pipeline.py --day's
-own busiest-moment logic - so one long pass doesn't fill several slots of
-the top-N list by itself.
+the next.
 
 Usage:
     python find_busiest.py FOV_PASSES_DIR --season [--top 10]
