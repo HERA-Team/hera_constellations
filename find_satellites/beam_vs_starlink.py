@@ -4,14 +4,10 @@ beam_vs_starlink.py
 Propagates many satellites (e.g. a Starlink shell) from a TLE file using
 SGP4, keeps only the positions that fall inside HERA's field of view (beam)
 during night-time hours, and plots those in-beam points on the sky
-(RA/Dec) together with the beam's drifting outline. Used to see how often
-and where satellites cross HERA's beam over an observing run, which is
-when they can contaminate 21cm observations.
+(RA/Dec) together with the beam's drifting outline.
 
 The beam is modelled as a circular disk of fixed angular radius
-(`fov_angular_radius`) centred on HERA's zenith - HERA is a drift-scan
-telescope, so the beam center stays at zenith and drifts across the sky in
-RA as Earth rotates, while its declination stays fixed at HERA's latitude.
+(`fov_angular_radius`) centred on HERA's zenith.
 
 Outputs:
     - Console: number of satellites read from the TLE file.
@@ -21,9 +17,7 @@ Outputs:
     - Text file (<outfile stem>_fov_times.txt): for each satellite, the UTC
       timestamp it first enters the beam and the timestamp of its last
       in-beam sample before leaving, i.e. the start/end of its FOV crossing
-      in this window. Computed from beam membership regardless of
-      --all-positions, so it's always the true entry/exit time, not just
-      the first/last propagated sample.
+      in this window.
 
 Usage:
     python beam_vs_starlink.py TLE_FILE
@@ -32,8 +26,8 @@ Usage:
     python beam_vs_starlink.py TLE_FILE --start ... --end ... \
         --from-passes-dir path/to/find_fov_passes_outdir
 
-With no --start/--end, defaults to a built-in ~10 min "busiest period"
-preset (2022-11-13T21:45:10 to 21:55:10). Override both to point at a
+With no --start/--end, defaults to 23:50-23:59 UTC on the date of the
+TLE file (the median epoch of its TLEs). Override both to point at a
 different window, e.g. one found by Find Busy Times/find_busy.py.
 
 --from-passes-dir speeds this up a lot for a short window over a big TLE
@@ -43,12 +37,8 @@ checks find_fov_passes.py's existing <SAT>_results.csv output for which
 satellites have a pass in --start/--end, and only propagates those.
 
 --all-positions disables the beam-membership filter, plotting every
-night-time position of every satellite instead (the old rafas.py
-behaviour) - useful for comparing side by side against the default
-beam-filtered plot.
+night-time position of every satellite instead.
 
-To reuse for a different site/beam, edit parameters.py (HERA location, beam
-radius) - shared with find_fov_passes.py, rather than a second copy here.
 """
 
 import argparse
@@ -59,19 +49,10 @@ import numpy as np
 
 from astropy import units
 from astropy.time import Time
-# GCRS: the sky frame (RA/Dec) satellite/beam positions are converted to for
-#   plotting - GCRS, not ICRS: ICRS applies a stellar-aberration correction
-#   that assumes the object is effectively at infinite distance, which is
-#   wrong for a satellite ~600-2000 km away (finite `distance` inherited
-#   from AltAz) and silently gives a wildly wrong RA/Dec (tens of degrees
-#   off) with no error. GCRS correctly handles the topocentric->geocentric
-#   step for near-Earth distances and shares ICRS's orientation to well
-#   under an arcsecond, so it's the right frame for both the satellite and
-#   the beam outline.
-from astropy.coordinates import AltAz, GCRS, SkyCoord
+from astropy.coordinates import GCRS, SkyCoord
 
-from tqdm import tqdm         # progress bar over satellites
-from multiprocessing import Pool, RLock   # one worker process per satellite
+from tqdm import tqdm
+from multiprocessing import Pool, RLock
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -81,15 +62,35 @@ from matplotlib.cm     import ScalarMappable
 from parameters import hera_location, fov_angular_radius, position_angles
 from utils import (
     read_tle_file, make_time_grid, filter_to_night, propagate_in_beam,
-    satellites_in_window,
 )
 
-# Built-in fallback window, used only if --start/--end aren't given: a
-# known ~10 min "busiest" period with many overlapping passes, sampled
-# finely enough (1 s) that a short pass (as brief as ~7 s across the beam)
-# isn't stepped over between samples.
-DEFAULT_START = "2022-11-13T21:45:10"
-DEFAULT_END = "2022-11-13T21:55:10.000"
+# Built-in fallback window, used only if --start/--end aren't given:
+# 23:50-23:59 UTC (01:50-01:59 local at HERA, so always night-time) on
+# the date of the TLE file's epochs - see default_window().
+DEFAULT_START_HMS = "23:50:00"
+DEFAULT_END_HMS = "23:59:00"
+
+
+def tle_epoch_date(sats):
+    """UTC date (YYYY-MM-DD) of the median TLE epoch across `sats`.
+
+    The epoch is read from TLE line 1, columns 19-32 (YYDDD.DDDDDDDD).
+    The median, not the first or the mean, so a few stale TLEs don't pull
+    the date away from the rest of the file.
+    """
+    jds = []
+    for _, tle1, _ in sats:
+        yy = int(tle1[18:20])
+        year = 2000 + yy if yy < 57 else 1900 + yy  # standard TLE convention
+        day_of_year = float(tle1[20:32])
+        jds.append(Time(f"{year}-01-01T00:00:00", scale="utc").jd + day_of_year - 1)
+    return Time(np.median(jds), format="jd", scale="utc").datetime.strftime("%Y-%m-%d")
+
+
+def default_window(sats):
+    """(start, end) ISO strings of the fallback window for this TLE file."""
+    day = tle_epoch_date(sats)
+    return f"{day}T{DEFAULT_START_HMS}", f"{day}T{DEFAULT_END_HMS}"
 
 
 def parse_args():
@@ -103,12 +104,12 @@ def parse_args():
     parser.add_argument(
         "--start", default=None,
         help=f"Start of the time window (UTC, ISO format). Defaults to "
-             f"{DEFAULT_START} if neither --start nor --end is given.",
+             f"{DEFAULT_START_HMS} UTC on the TLE file's epoch date.",
     )
     parser.add_argument(
         "--end", default=None,
         help=f"End of the time window (UTC, ISO format). Defaults to "
-             f"{DEFAULT_END} if neither --start nor --end is given.",
+             f"{DEFAULT_END_HMS} UTC on the TLE file's epoch date.",
     )
     parser.add_argument(
         "--time-delta", type=float, default=None,
@@ -124,23 +125,16 @@ def parse_args():
     )
     parser.add_argument(
         "--from-passes-dir", default=None, metavar="DIR",
-        help="Directory of find_fov_passes.py's <SAT>_results.csv output "
-             "(its 'outdir'). If given, only satellites with at least one "
+        help="Directory of find_fov_passes.py's <SAT>_results.csv output. "
+             "If given, only satellites with at least one "
              "recorded pass inside --start/--end are propagated here, "
-             "skipping the rest of the TLE file entirely - useful since "
-             "most satellites never cross the beam in a given short "
-             "window. Trajectories are still freshly propagated at "
-             "--time-delta resolution for whichever satellites are kept "
-             "(the CSVs are only used to pick which ones, not read for "
-             "positions - they're coarser-cadence than a close-up window "
-             "usually wants). Defaults --time-delta to 1 s instead of 5 s "
-             "when set, since the point is a close look at few satellites.",
+             "skipping the rest of the TLE file entirely. " 
+             "Trajectories are still freshly propagated at "
+             "--time-delta resolution.. Defaults --time-delta to 1s.",
     )
     parser.add_argument(
         "--constellation", default="Satellite",
-        help="Constellation name, used only for the default plot title "
-             "(default: 'Satellite', giving 'Satellite Passes through "
-             "HERA FoV').",
+        help="Constellation name, used only for the default plot title ",
     )
     parser.add_argument(
         "--outfile", default="beam_vs_starlink.png",
@@ -148,18 +142,12 @@ def parse_args():
     )
     parser.add_argument(
         "--no-progress", action="store_true",
-        help="Disable the tqdm progress bar over satellites (useful for "
-             "Slurm/batch jobs, where in-place redraws just clutter the "
-             "log file).",
+        help="Disable the tqdm progress bar over satellites.",
     )
     parser.add_argument(
         "--all-positions", action="store_true",
         help="Plot every propagated night-time position instead of only "
-             "the ones inside the beam - reproduces the old rafas.py "
-             "behaviour (full tracks, no beam-membership filtering), for "
-             "comparing against the default beam-filtered plot. The beam "
-             "outline is still drawn for reference; only the filtering of "
-             "satellite points changes.",
+             "the ones inside the beam.",
     )
     return parser.parse_args()
 
@@ -187,11 +175,6 @@ def work_func_sat(sat_data, night_ts, in_beam_only=True):
     x, y, z = [], [], []
     ra, dec = [], []
     idx = []  # position of each hit in the original `times`, for date_nums[idx] later
-    # First/last timestamp actually inside the beam - tracked from zen_sep
-    # directly (not from `idx`/in_beam_only) so it's correct even in
-    # --all-positions mode, where every night-time sample is yielded/kept,
-    # not just in-beam ones. `times` is chronological, so the first/last
-    # in-beam sample encountered here is the true entry/exit time.
     beam_entry, beam_exit = None, None
 
     for sample_idx, t1, itrs, altaz, zen_sep in propagate_in_beam(
@@ -204,17 +187,7 @@ def work_func_sat(sat_data, night_ts, in_beam_only=True):
             beam_exit = t1
 
         # In-beam: convert to RA/Dec for plotting on the sky. Use only the
-        # alt/az *direction* (no distance) before transforming to GCRS -
-        # GCRS is geocentric, so transforming `altaz` as-is (its real,
-        # finite slant range) would re-centre it on Earth's core, introducing
-        # a large parallax shift for near-Earth objects (slant range
-        # comparable to Earth's radius) that the beam ring doesn't have (it's
-        # built the same way but with no distance, i.e. treated as being at
-        # infinity, like a star). Dropping the distance keeps both directly
-        # comparable: the plotted point ends up at the same fixed-sky
-        # direction that zen_sep already measures topocentrically, rather
-        # than the (parallax-shifted) direction to the satellite's actual 3D
-        # position as seen from Earth's centre.
+        # alt/az *direction* (no distance) before transforming to GCRS.
         altaz_dir = SkyCoord(alt=altaz.alt, az=altaz.az, frame='altaz',
                               location=hera_location, obstime=t1)
         sky = altaz_dir.transform_to(GCRS(obstime=t1))
@@ -241,18 +214,17 @@ def work_func_sat(sat_data, night_ts, in_beam_only=True):
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.start or args.end:
-        start_str = args.start or DEFAULT_START
-        end_str = args.end or DEFAULT_END
-    else:
-        start_str, end_str = DEFAULT_START, DEFAULT_END
+    # Read the TLE file up front: the fallback window's date comes from it.
+    sats = read_tle_file(args.tle_file)
+    default_start, default_end = default_window(sats)
+    start_str = args.start or default_start
+    end_str = args.end or default_end
     t0 = Time(start_str, format="isot", scale="utc")
     t_end = Time(end_str, format="isot", scale="utc")
 
     # --from-passes-dir narrows things down to a handful of satellites for a
     # close-up window, so default to finer (1 s) cadence than the plain
     # full-TLE-file case (5 s) 
-    # --time-delta still overrides either way.
     default_time_delta = 1.0 if args.from_passes_dir else 5.0
     time_delta = (args.time_delta if args.time_delta is not None
                   else default_time_delta) * units.s
@@ -270,21 +242,7 @@ if __name__ == "__main__":
             "the Sun is up the whole window. Pick a different --start/--end."
         )
 
-    # TLE file
-    sats = read_tle_file(args.tle_file)
     n_total = len(sats)
-
-    if args.from_passes_dir:
-        in_window_names = satellites_in_window(args.from_passes_dir, t0.iso, t_end.iso)
-        sats = [s for s in sats if s[0].strip() in in_window_names]
-        if not sats:
-            raise SystemExit(
-                f"--from-passes-dir {args.from_passes_dir}: no satellite has a "
-                f"recorded pass between {t0.iso} and {t_end.iso}. Check the "
-                "directory or decrease the time interval used to compute positions."
-            )
-        print(f"--from-passes-dir: {len(sats)}/{n_total} satellites have a "
-              f"pass in this window; propagating only those.")
 
     # --limit caps how many are read, for a quick test run; default is every
     # satellite kept above.
@@ -323,8 +281,7 @@ if __name__ == "__main__":
 
     # Build FoV outline (zenith radius 5 deg) for each time stamp.
     # Centre = HERA's zenith, transformed AltAz -> GCRS the same way satellite
-    # positions are (see the import comment for why GCRS, not ICRS), so the
-    # outline lines up with the satellite track frame (using LST directly).
+    # positions are.
     fov_ra, fov_dec = [], []
     centre_ra_wrapped = []
     for t in night_ts['time']:
@@ -338,30 +295,14 @@ if __name__ == "__main__":
         fov_ra.append(ring.ra.deg)  # still wrapped into [0,360) here - fixed below
         fov_dec.append(ring.dec.deg)
 
-    # Make RA continuous (allowed to run past 360 deg or below 0 deg)
-    # instead of wrapping into [0,360): a night's beam drift is one
-    # continuous sweep, but wrap_at(360) folds it back whenever it crosses
-    # the 0/360 seam - which for ax.fill() below means two *adjacent*
-    # vertices of the same ring can land on opposite sides of the seam
-    # (e.g. 359.5 next to 0.3), and matplotlib just draws a straight edge
-    # between them with no concept of the wrap, producing a spurious edge
-    # stretching almost the full width of the plot. Fix: unwrap the (one
-    # value per timestamp) centre RA across the whole night with
-    # np.unwrap - safe since consecutive timestamps are only a tiny
-    # fraction of a degree apart - then re-express every ring's vertices
-    # as a small, always-well-behaved offset from that continuous centre,
-    # rather than trying to patch up each ring's own wrapped vertex loop.
+    # Make RA continuous
     centre_ra_wrapped = np.array(centre_ra_wrapped)
     centre_ra_unwrapped = np.degrees(np.unwrap(np.radians(centre_ra_wrapped)))
     for i in range(len(fov_ra)):
         offset = ((fov_ra[i] - centre_ra_wrapped[i] + 180) % 360) - 180
         fov_ra[i] = centre_ra_unwrapped[i] + offset
 
-    # Satellite RA gets the same treatment, keyed by each point's `idx`
-    # (its position in night_ts, matching centre_ra_wrapped/_unwrapped's own
-    # indexing) - so satellite tracks and the FoV shading share one
-    # continuous RA axis instead of the satellite dots staying wrapped
-    # while the shading doesn't.
+    # Satellite RA gets the same treatment, keyed by each point's `idx`.
     results = [
         (satname, lat, lon,
          centre_ra_unwrapped[idx] + (((ra_arr - centre_ra_wrapped[idx] + 180) % 360) - 180),
@@ -402,29 +343,14 @@ if __name__ == "__main__":
             facecolor=cmap(norm(tn)), edgecolor='none',
             alpha=0.05, zorder=0
         )
-    # # FoV polygons
-    # for ra_fov, dec_fov in zip(fov_ra, fov_dec):
-    #     ax.fill(ra_fov, dec_fov, edgecolor='none', alpha=0.009,
-    #             color="teal", zorder=0)
 
-    # satellite tracks. Colour by each point's own timestamp (date_nums[idx],
-    # not date_nums[:len(ra_arr)] which paired points with the wrong times
-    # once they were filtered down to in-beam samples), and share one
-    # cmap/norm across satellites so the colour scale is consistent and the
-    # colorbar below doesn't depend on which satellite happens to be plotted
-    # last (some have zero in-beam points).
+    # satellite tracks. Colour by each point's own timestamp.
     for satname, lat, lon, ra_arr, dec_arr, idx, _, _ in results:
         ax.scatter(ra_arr, dec_arr,
                    c=date_nums[idx], marker='o', zorder=10,
                    cmap=cmap, norm=norm, s=25, edgecolors='black', linewidths=0.5,
                    label=satname)
 
-    # Not 'equal': the RA range covered here (up to ~360 deg, since the
-    # night-time filter can produce blocks many hours apart, over which
-    # HERA's zenith RA sweeps most of the sky) vastly exceeds the Dec
-    # range (~2*fov_angular_radius, fixed by the beam). An equal aspect
-    # would force 1 deg RA == 1 deg Dec on screen and squash the whole
-    # plot into an unreadable sliver.
     ax.set_aspect('auto')
     ax.set_xlabel("Right Ascension (deg)")
     ax.set_ylabel("Declination (deg)")
@@ -433,11 +359,6 @@ if __name__ == "__main__":
     ax.set_xlim(ra_min - 2, ra_max + 2)
     ax.set_ylim(dec_min - 2, dec_max + 2)
     title_suffix = " (all positions, no beam filter)" if args.all_positions else ""
-    # night_ts[0]/[-1] (not t0/t_end): --start/--end is often a deliberately
-    # padded request window (e.g. run_pipeline.py passes a noon-to-noon span
-    # for a --season busiest-night plot) - showing the actual night-filtered
-    # bounds here means the title always reflects what was really plotted,
-    # not the raw, wider request.
     ax.set_title(f"{args.constellation} Passes through HERA FoV{title_suffix}\n"
                  f"{night_ts['time'][0].iso} to {night_ts['time'][-1].iso}")
     ax.grid(alpha=0.5)
