@@ -80,28 +80,26 @@ def filter_to_night(ts, location):
     return TimeSeries(time=ts['time'][sun_alt < 0 * units.deg])
 
 
-def propagate_in_beam(name, tle_line1, tle_line2, times, location, fov_radius,
-                       in_beam_only=True):
-    """Propagate one satellite across `times` and yield samples inside the beam.
-
-    Builds its own SGP4 propagator from the TLE, then for each timestamp in
-    `times` (iterable of astropy Time objects) runs the conversion: 
-    SGP4 -> TEME -> ITRS -> AltAz, testing whether the result falls
-    within `fov_radius` of `location`'s zenith. 
-    Note: SGP4 errors are silently skipped.
-
-    in_beam_only: if True (default), samples outside `fov_radius` of zenith
-    are skipped too, so only true beam crossings are yielded. Pass
-    False to yield every sample regardless of beam membership.
-
-    Yields (idx, t1, itrs, altaz, zen_sep) 
-    - idx is the position of t1 in the original `times` sequence 
-    - itrs/altaz are the corresponding coordinate frame objects 
-    - zen_sep is the angular distance from zenith
+def night_label(t):
+    """The UTC date a night starting around `t` is labeled by - dusk that
+    day to dawn the next, matching find_fov_passes.py's --day convention
+    (noon UTC to noon UTC the next day). Shifting back 12h before taking
+    the date means a timestamp just before or after UTC midnight, from the
+    same physical HERA night (which spans roughly 16:30-03:30 UTC,
+    straddling midnight), gets the same label. find_busy.dates_of() uses
+    this same one-liner directly, so the two places that must agree on
+    "what night does this timestamp belong to" can't drift apart.
     """
-    sat = Satrec.twoline2rv(tle_line1, tle_line2)
+    return (t - 12 * units.hour).iso.split()[0]
 
-    for idx, t1 in enumerate(times):
+
+def _propagate_samples(sat, indexed_times, location, fov_radius, in_beam_only):
+    """Shared inner loop for propagate_in_beam()/propagate_in_beam_daily_tle():
+    propagate one already-built Satrec across (idx, t1) pairs, yielding
+    samples inside the beam (or every sample, if in_beam_only is False).
+    See propagate_in_beam()'s docstring for the yielded tuple shape.
+    """
+    for idx, t1 in indexed_times:
         # Propagate the TLE to time t1: returns position/velocity in the
         # (quasi-inertial) TEME frame.
         error_code, teme_p, teme_v = sat.sgp4(t1.jd1, t1.jd2)
@@ -126,6 +124,80 @@ def propagate_in_beam(name, tle_line1, tle_line2, times, location, fov_radius,
             continue  # outside the beam - skip
 
         yield idx, t1, itrs, altaz, zen_sep
+
+
+def propagate_in_beam(name, tle_line1, tle_line2, times, location, fov_radius,
+                       in_beam_only=True):
+    """Propagate one satellite across `times` and yield samples inside the beam.
+
+    Builds its own SGP4 propagator from the TLE, then for each timestamp in
+    `times` (iterable of astropy Time objects) runs the conversion:
+    SGP4 -> TEME -> ITRS -> AltAz, testing whether the result falls
+    within `fov_radius` of `location`'s zenith.
+    Note: SGP4 errors are silently skipped.
+
+    in_beam_only: if True (default), samples outside `fov_radius` of zenith
+    are skipped too, so only true beam crossings are yielded. Pass
+    False to yield every sample regardless of beam membership.
+
+    Yields (idx, t1, itrs, altaz, zen_sep)
+    - idx is the position of t1 in the original `times` sequence
+    - itrs/altaz are the corresponding coordinate frame objects
+    - zen_sep is the angular distance from zenith
+    """
+    sat = Satrec.twoline2rv(tle_line1, tle_line2)
+    yield from _propagate_samples(sat, enumerate(times), location, fov_radius, in_beam_only)
+
+
+def propagate_in_beam_daily_tle(name, tle_by_date, times, location, fov_radius,
+                                 in_beam_only=True):
+    """Like propagate_in_beam(), but resolves a different TLE per night
+    instead of one fixed TLE for the whole `times` range.
+
+    tle_by_date: {date_str: (tle_line1, tle_line2)} for this ONE satellite -
+    one entry per day a daily-TLE directory (see
+    fetch_constellation_tles.py --season) had data for it; may be sparse
+    (e.g. missing before the satellite was catalogued).
+
+    Each timestamp in `times` is grouped by the night it belongs to (via
+    night_label(), so a night never gets split across two TLEs just
+    because it straddles UTC midnight), and each night's group is
+    propagated with that night's own closest-available TLE - falling back
+    to the nearest date actually present in tle_by_date if that exact
+    night isn't there. This is what keeps propagation accurate deep into
+    an 8-month season instead of drifting away from one fixed epoch.
+
+    Yields the same (idx, t1, itrs, altaz, zen_sep) tuples as
+    propagate_in_beam(), grouped/ordered by night (chronologically) rather
+    than by original index - neither find_fov_passes.py's nor
+    beam_vs_starlink.py's work_func_sat depend on strict original-index
+    order, only on getting every (idx, ...) tuple eventually.
+    """
+    if not tle_by_date:
+        return  # no TLE data at all for this satellite in the given directory
+
+    by_night = {}
+    for idx, t1 in enumerate(times):
+        by_night.setdefault(night_label(t1), []).append((idx, t1))
+
+    available_dates = sorted(tle_by_date)
+    sat_cache = {}  # resolved date_str -> Satrec, built lazily
+    for night in sorted(by_night):
+        if night in tle_by_date:
+            resolved_date = night
+        else:
+            night_jd = Time(night, scale="utc").jd
+            resolved_date = min(
+                available_dates,
+                key=lambda d: abs(Time(d, scale="utc").jd - night_jd),
+            )
+        if resolved_date not in sat_cache:
+            tle_line1, tle_line2 = tle_by_date[resolved_date]
+            sat_cache[resolved_date] = Satrec.twoline2rv(tle_line1, tle_line2)
+
+        yield from _propagate_samples(
+            sat_cache[resolved_date], by_night[night], location, fov_radius, in_beam_only
+        )
 
 
 def satellites_in_window(passes_dir, start_iso, end_iso):

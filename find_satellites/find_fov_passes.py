@@ -25,14 +25,18 @@ Outputs (written to --outdir, the current working directory by default):
       peak memory (RSS) and other resource-usage stats for the whole run.
 
 Usage:
-    python find_fov_passes.py [tle_file] --day 2022-11-13 [--outdir OUTDIR]
-    python find_fov_passes.py [tle_file] --season 2022 [--outdir OUTDIR]
-    python find_fov_passes.py --tle-dir DAILY_TLE_DIR --season 2022 [--outdir OUTDIR]
+    python find_fov_passes.py TLE_FILE --day 2022-11-13 [--outdir OUTDIR]
+    python find_fov_passes.py TLE_FILE --season 2022 [--outdir OUTDIR]
+    python find_fov_passes.py DAILY_TLE_DIR --season 2022 [--outdir OUTDIR]
 
-    tle_file defaults to "tle_sample.txt" in the current directory if not
-    given. It must list satellites in the standard 3-line format (name,
-    TLE line 1, TLE line 2), blank lines are ignored - see
-    utils.read_tle_file().
+    tle (required) is either:
+    - a single TLE file, listing satellites in the standard 3-line format
+      (name, TLE line 1, TLE line 2), blank lines ignored - see
+      utils.read_tle_file(); or
+    - a directory of daily TLE files (<date>_<constellation>_tles.txt, as
+      written by fetch_constellation_tles.py --season), --season mode
+      only. Each satellite is then propagated with its own
+      closest-available TLE per night.
 
     --outdir defaults to the current directory, and is created if missing.
 
@@ -41,10 +45,6 @@ Usage:
                    starts at dusk on Nov 13 and ends at dawn on Nov 14.
     --season YEAR  a full observing season: Sept 1 of YEAR to Apr 30 of
                    YEAR+1, e.g. --season 2022 for 2022-09-01 - 2023-04-30.
-
-    --tle-dir DIR replaces the single tle_file with a directory of daily
-    TLE files in the --season mode. Each
-    satellite is propagated with its own closest-available TLE per night.
 
     --time-delta overrides the sampling cadence in seconds (default: 5 s
     for --day, 50 s for --season).
@@ -87,16 +87,11 @@ def parse_args():
                      "position at which each one is inside HERA's FOV.",
     )
     parser.add_argument(
-        "tle_file", nargs="?", default=None,
-        help="TLE file listing satellites in the standard 3-line format "
-             "(name, TLE line 1, TLE line 2), blank lines ignored. "
-             "Defaults to 'tle_sample.txt' in the current directory. "
-             "Mutually exclusive with --tle-dir.",
-    )
-    parser.add_argument(
-        "--tle-dir", default=None, metavar="DIR",
-        help="Directory of daily TLE files (one <date>_<constellation>_"
-             "tles.txt per day) in --season mode only.",
+        "tle",
+        help="Either a single TLE file (standard 3-line format: name, TLE "
+             "line 1, TLE line 2; blank lines ignored), or a directory of "
+             "daily TLE files (one <date>_<constellation>_tles.txt per "
+             "day), --season mode only.",
     )
     parser.add_argument(
         "--outdir", default=".",
@@ -133,17 +128,17 @@ def parse_args():
     )
     args = parser.parse_args()
 
-    if args.tle_dir and args.day:
-        parser.error("--tle-dir requires --season, not --day.")
-    if args.tle_dir and args.tle_file is not None:
-        parser.error("cannot combine a positional tle_file with --tle-dir.")
-    if not args.tle_dir and args.tle_file is None:
-        args.tle_file = "tle_sample.txt"  # restore the old default
+    if not os.path.exists(args.tle):
+        parser.error(f"tle: {args.tle} does not exist.")
+    if os.path.isdir(args.tle) and args.day:
+        parser.error("a directory of daily TLE files requires --season, not --day.")
 
     return args
 
 
 args = parse_args()
+# tle is a directory of daily TLE files (--season only) rather than one file.
+daily_tles = os.path.isdir(args.tle)
 
 
 # ------------------------- Global parameters -------------------------
@@ -180,10 +175,10 @@ if is_main_process:
     print("\nFOV of HERA:", fov_angular_radius*2.)
     print(f"\nTime delta: {time_delta} ")
 
-# --tle-dir: one TLE file per day instead of a single tle_file.
-if args.tle_dir:
+# Directory of daily TLEs: one TLE file per day instead of a single file.
+if daily_tles:
     tle_by_sat = {}
-    for path in sorted(glob.glob(os.path.join(args.tle_dir, "*_tles.txt"))):
+    for path in sorted(glob.glob(os.path.join(args.tle, "*_tles.txt"))):
         match = re.match(r"^(\d{4}-\d{2}-\d{2})_", os.path.basename(path))
         if not match:
             print(f"Warning: {path} doesn't match <date>_<constellation>_tles.txt; skipping.")
@@ -192,8 +187,8 @@ if args.tle_dir:
         for name, tle_line1, tle_line2 in read_tle_file(path):
             tle_by_sat.setdefault(name.strip(), {})[date_str] = (tle_line1, tle_line2)
     if is_main_process:
-        print(f"\n--tle-dir {args.tle_dir}: {len(tle_by_sat)} satellites across "
-              f"{len(glob.glob(os.path.join(args.tle_dir, '*_tles.txt')))} daily TLE files.")
+        print(f"\nTLE directory {args.tle}: {len(tle_by_sat)} satellites across "
+              f"{len(glob.glob(os.path.join(args.tle, '*_tles.txt')))} daily TLE files.")
 else:
     tle_by_sat = None
 
@@ -206,7 +201,7 @@ def work_func_sat(sat_data, outdir):
     Run in its own process, one call per satellite.
 
     """
-    if args.tle_dir:
+    if daily_tles:
         name = sat_data
         tle_by_date = tle_by_sat.get(name, {})
     else:
@@ -214,8 +209,8 @@ def work_func_sat(sat_data, outdir):
     satellite_name = name.strip()
     output_filename = os.path.join(outdir, f"{satellite_name.replace(' ', '_')}_results.csv")
     time_delta_s = time_delta.to_value(units.s)
-    # A single TLE pair doesn't mean anything in --tle-dir mode.
-    expected_tle_source = str(Path(args.tle_dir).resolve()) if args.tle_dir else None
+    # A single TLE pair doesn't mean anything with a daily TLE directory.
+    expected_tle_source = str(Path(args.tle).resolve()) if daily_tles else None
 
     if not args.overwrite and os.path.exists(output_filename):
         existing_delta_s = None
@@ -240,7 +235,7 @@ def work_func_sat(sat_data, outdir):
     with open(output_filename, 'w') as f:
         # Metadata comment lines
         f.write(f"# satellite: {satellite_name}\n")
-        if args.tle_dir:
+        if daily_tles:
             f.write(f"# tle_source: {expected_tle_source}\n")
         else:
             f.write(f"# tle_line1: {tle_line1}\n")
@@ -248,8 +243,8 @@ def work_func_sat(sat_data, outdir):
         f.write(f"# time_delta_s: {time_delta_s}\n")
         f.write("timestamp,alt_deg,az_deg,zensep_deg\n")
 
-    if args.tle_dir:
-        crossings = propagate_in_beam_daily_tle(
+    if daily_tles:
+        crossings =propagate_in_beam_daily_tle(
             satellite_name, tle_by_date, night_ts['time'],
             hera_location, fov_angular_radius,
         )
@@ -270,7 +265,7 @@ def work_func_sat(sat_data, outdir):
 # ------------------------------- Main -----------------------------------
 
 if __name__ == "__main__":
-    satellites_data = sorted(tle_by_sat) if args.tle_dir else read_tle_file(args.tle_file)
+    satellites_data = sorted(tle_by_sat) if daily_tles else read_tle_file(args.tle)
 
     os.makedirs(args.outdir, exist_ok=True)
     running_details = os.path.join(args.outdir, "Running_details.txt")

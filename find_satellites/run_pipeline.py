@@ -12,7 +12,8 @@ exclusive:
     2. Find every FOV crossing (find_fov_passes.py --day/--season):
        propagates every satellite and records each night-time timestamp
        it's inside HERA's beam, over the one night or the whole season
-       (using each night's own daily TLE for --season, via --tle-dir).
+       (using each night's own daily TLE for --season, by passing it the
+       daily TLE directory).
     3. Find the busiest moment. For --day (find_busy.py), that is the exact timestamp
        with the most satellites simultaneously in the beam. For --season,
        that is the single night (across the whole season) with
@@ -251,7 +252,7 @@ def main():
     if args.day:
         fov_cmd += [str(tle_file), "--outdir", str(fov_dir), "--day", args.day]
     else:
-        fov_cmd += ["--tle-dir", str(daily_tle_dir), "--outdir", str(fov_dir),
+        fov_cmd += [str(daily_tle_dir), "--outdir", str(fov_dir),
                     "--season", str(args.season)]
     if args.no_progress:
         fov_cmd.append("--no-progress")

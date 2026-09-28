@@ -27,25 +27,31 @@ If unset, you'll be prompted for them interactively instead.
 
 - **`run_pipeline.py`**: end-to-end pipeline for one constellation on one
   night: fetches TLEs, finds every FOV crossing, locates the busiest moment,
-  and plots the trajectories around it. This is the main entry point - see
-  the usage example below.
-- **`fetch_constellation_tles.py`** queries Space-Track for the archival
-  TLE closest to a given date, for every satellite in a named constellation,
-  and writes them out in the 3-line (name / line1 / line2) format the other
-  scripts expect.
+  and plots the trajectories around it. See the usage example below.
+- **`fetch_constellation_tles.py`** queries Space-Track for archival TLEs
+  of every satellite in a named constellation, and writes them out in the
+  3-line (name / line1 / line2) format the other scripts expect. With
+  `--date`, it writes one file (`--out`) holding each satellite's TLE
+  closest to that date, searched within ±3 days of it. With `--season`, it
+  writes one file per day of the season into a directory (`--outdir`).
 - **`find_fov_passes.py`** is a batch FOV-pass finder: propagates every
-  satellite in a TLE file with SGP4 across a night or a full observing season, 
+  satellite with SGP4 across a night or a full observing season,
   restricted to night-time hours at the HERA location,
   and writes out every timestamp + position at which each one is
-  inside the FOV. Produces one `<SATELLITE_NAME>_results.csv` per satellite
-  plus a `Running_details.txt` with run parameters and resource usage.
+  inside the FOV. Its required `tle` argument is either a single TLE file,
+  or (`--season` only) a directory of daily TLE files, in which case each
+  night uses that night's own TLEs. Produces one `<SATELLITE_NAME>_results.csv`
+  per satellite plus a `Running_details.txt` with run parameters and
+  resource usage.
 - **`find_busy.py`** reads `find_fov_passes.py`'s `*_results.csv` output
   and reports either the busiest/quietest calendar date across the
   observation window (`day` mode) or the busiest/quietest time-of-day across
   all nights (`time` mode).
 - **`beam_vs_starlink.py`** propagates satellites over a given time
   window, keeps only the positions inside HERA's beam, and plots their
-  RA/Dec trajectories together with the beam's drifting outline. Can reuse
+  RA/Dec trajectories together with the beam's drifting outline. The window
+  is set with `--start`/`--end`; without them, it defaults to 23:50-23:59 UTC
+  on the date of the TLE file (the median epoch of its TLEs). Can reuse
   `find_fov_passes.py`'s output (`--from-passes-dir`) to skip re-propagating
   satellites that never cross the beam in the window.
 - **`parameters.py`** holds shared physical/geometry constants.
